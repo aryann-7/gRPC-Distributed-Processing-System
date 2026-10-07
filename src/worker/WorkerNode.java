@@ -19,8 +19,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import worker.computation.JobRunner;
+import worker.computation.TaskExecutionEngine;
 import worker.coordinator.CoordinatorManager;
 import worker.election.ElectionManager;
+import worker.grpc.WorkerGrpcServer;
 
 public class WorkerNode extends UnicastRemoteObject
                 implements WorkerService {
@@ -40,6 +42,8 @@ public class WorkerNode extends UnicastRemoteObject
         private final Map<String, Integer> electionParents = new ConcurrentHashMap<>();
         private final Map<String, Set<Integer>> pendingReplies = new ConcurrentHashMap<>();
         private final Map<String, ElectionCandidate> bestCandidates = new ConcurrentHashMap<>();
+        private final WorkerGrpcServer grpcServer;
+        private final TaskExecutionEngine executionEngine;
 
         public WorkerNode(
                         int workerId,
@@ -51,6 +55,15 @@ public class WorkerNode extends UnicastRemoteObject
                 this.workerId = workerId;
                 this.host = host;
                 this.port = port;
+
+                // Initialize and start the embedded gRPC server on the worker port
+                this.grpcServer = new WorkerGrpcServer(workerId, port, 4);
+                this.executionEngine = this.grpcServer.getExecutionEngine();
+                try {
+                        this.grpcServer.start();
+                } catch (Exception e) {
+                        System.err.println("Worker " + workerId + " failed to start gRPC server on port " + port + ": " + e.getMessage());
+                }
         }
 
         /**
@@ -803,6 +816,24 @@ public class WorkerNode extends UnicastRemoteObject
 
         public int getCurrentTerm() {
                 return currentTerm.get();
+        }
+
+        public WorkerGrpcServer getGrpcServer() {
+                return grpcServer;
+        }
+
+        public TaskExecutionEngine getExecutionEngine() {
+                return executionEngine;
+        }
+
+        public void stop() {
+                if (grpcServer != null) {
+                        try {
+                                grpcServer.stop();
+                        } catch (Exception e) {
+                                e.printStackTrace();
+                        }
+                }
         }
 
         private static class ElectionCandidate {
