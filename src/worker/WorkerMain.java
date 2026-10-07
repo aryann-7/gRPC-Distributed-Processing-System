@@ -71,7 +71,7 @@ public class WorkerMain {
                                                         " started.");
 
                         System.out.println(
-                                        "Port: " + workerPort);
+                                        "gRPC / Service Port: " + workerPort);
 
                         System.out.println(
                                         "JAC: " + worker.getJac());
