@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package distrilab;
+
+import "common.proto";
+
+option java_multiple_files = true;
+option java_package = "common.grpc";
+option java_outer_classname = "ElectionServiceProto";
+
+// Handlers validate non-empty IDs, positive terms/worker IDs and non-negative JAC.
+// Invalid messages return INVALID_ARGUMENT; RPC success acknowledges receipt only.
+service ElectionService {
+    rpc ReceiveElection(ElectionRequest) returns (ElectionAcknowledgement);
+    rpc ReceiveElectionReply(ElectionReplyRequest) returns (ElectionAcknowledgement);
+    rpc AnnounceCoordinator(CoordinatorAnnouncement) returns (ElectionAcknowledgement);
+}
+
+message ElectionRequest {
+    // One ID per election flood; forwarding/retries preserve it and the term.
+    string election_id = 1;
+    int32 term = 2;
+    // Immediate sending neighbour; changes on each forwarding hop.
+    int32 sender_id = 3;
+    int32 candidate_id = 4;
+    int32 candidate_jac = 5;
+}
+
+message ElectionReplyRequest {
+    // Correlates with the original flood, including replies on duplicate edges.
+    string election_id = 1;
+    int32 term = 2;
+    // Identifies the child/edge whose reply the parent is waiting for.
+    int32 sender_id = 3;
+    int32 candidate_id = 4;
+    int32 candidate_jac = 5;
+}
+
+message CoordinatorAnnouncement {
+    // Separate from election_id, as in A1; preserve it across forwarding/retries.
+    string message_id = 1;
+    int32 term = 2;
+    int32 sender_id = 3;
+    // Winner identity, not the forwarding worker. Resolve session from membership.
+    WorkerIdentity coordinator = 4;
+    int32 coordinator_jac = 5;
+}
+
+// Receipt is not an election result or a substitute for ReceiveElectionReply.
+// Duplicate handling and parent/child tracking belong to the election owner.
+message ElectionAcknowledgement {}
