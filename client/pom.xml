@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   DistriLab client: a separate project, as the A2 spec requires.
-  It shares only the contract ../proto/client.proto with the bootstrap and
-  worker projects; it does not depend on any of their Java code.
+  It shares only the team's .proto contract in ../proto (common, worker,
+  bootstrap, coordinator) with the bootstrap and worker projects; it does
+  not depend on any of their Java code.
 
   Build and test:   mvn test
   Run the client:   mvn -q compile exec:java -Dexec.args="1 localhost 50050"
@@ -90,7 +91,8 @@
             </extension>
         </extensions>
         <plugins>
-            <!-- Generates Java classes and gRPC stubs from the shared client.proto. -->
+            <!-- Generates Java classes and gRPC stubs from the team's shared .proto files.
+                 coordinator.proto imports common.proto and worker.proto, so all four are needed. -->
             <plugin>
                 <groupId>org.xolstice.maven.plugins</groupId>
                 <artifactId>protobuf-maven-plugin</artifactId>
@@ -101,7 +103,10 @@
                     <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
                     <protoSourceRoot>${project.basedir}/../proto</protoSourceRoot>
                     <includes>
-                        <include>client.proto</include>
+                        <include>common.proto</include>
+                        <include>worker.proto</include>
+                        <include>bootstrap.proto</include>
+                        <include>coordinator.proto</include>
                     </includes>
                 </configuration>
                 <executions>

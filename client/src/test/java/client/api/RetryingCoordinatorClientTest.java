@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import client.model.JobKind;
 import client.model.JobSpec;
+import client.progress.ProgressSnapshot;
 import client.progress.WorkerProgress;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -35,7 +36,7 @@ public class RetryingCoordinatorClientTest {
             new Thread(() -> {
                 switch (outcome) {
                     case "ok" -> {
-                        listener.onProgress(new WorkerProgress(101, "t1", 2, 2, "COMPLETED"));
+                        listener.onProgress(new ProgressSnapshot(false, 2, 2, List.of(new WorkerProgress(101, 2, 2))));
                         listener.onCompleted(99);
                     }
                     case "retryable" -> listener.onFailed("coordinator gone", true);
@@ -56,7 +57,7 @@ public class RetryingCoordinatorClientTest {
         volatile boolean failureRetryable;
         final List<Integer> retries = new CopyOnWriteArrayList<>();
 
-        @Override public void onProgress(WorkerProgress p) { }
+        @Override public void onProgress(ProgressSnapshot s) { }
         @Override public void onCompleted(long r) { result = r; done.countDown(); }
         @Override public void onFailed(String m, boolean retryable) {
             failure = m;

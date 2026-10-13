@@ -3,23 +3,22 @@ package client.progress;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Holds the live progress of one submitted job.
  *
- * Updates arrive on gRPC threads while the GUI reads on the Swing thread,
- * so the per-task map is a ConcurrentHashMap and the job state is volatile.
+ * Updates arrive on gRPC threads while the GUI reads on the Swing thread.
+ * Each update is one immutable ProgressSnapshot stored in a volatile field,
+ * so a reader always sees one whole snapshot, never half of an update.
  */
 public class JobProgressTracker {
 
-    public enum State { SUBMITTED, RUNNING, RETRYING, COMPLETED, FAILED }
+    public enum State { SUBMITTED, QUEUED, RUNNING, RETRYING, COMPLETED, FAILED }
 
     private final String jobId;
     private final String jobType;
-    private final Map<String, WorkerProgress> tasks = new ConcurrentHashMap<>();
 
+    private volatile ProgressSnapshot latest;
     private volatile State state = State.SUBMITTED;
     private volatile Long result;
     private volatile String errorMessage;
@@ -30,11 +29,11 @@ public class JobProgressTracker {
         this.jobType = jobType;
     }
 
-    /** Records the latest progress for one sub-task (newest report wins). */
-    public void update(WorkerProgress progress) {
-        tasks.put(progress.taskId(), progress);
-        if (state == State.SUBMITTED || state == State.RETRYING) {
-            state = State.RUNNING;
+    /** Stores the coordinator's newest snapshot (it replaces the old one). */
+    public void apply(ProgressSnapshot snapshot) {
+        this.latest = snapshot;
+        if (!isFinished()) {
+            state = snapshot.queued() ? State.QUEUED : State.RUNNING;
         }
     }
 
@@ -49,39 +48,53 @@ public class JobProgressTracker {
     }
 
     /**
-     * The job is being submitted again (e.g. after a coordinator change).
-     * Progress from the abandoned attempt is cleared so the bar does not
-     * mix old and new work.
+     * The client is reconnecting (e.g. after a coordinator change). The old
+     * snapshot is cleared; the new coordinator's first message is a fresh
+     * full snapshot that refills it.
      */
     public void restart(int attemptNo) {
-        tasks.clear();
+        this.latest = null;
         this.attempt = attemptNo;
         this.state = State.RETRYING;
     }
 
     /**
-     * Overall completion = total units completed / total units, across all
-     * sub-tasks. Not an average of percentages: chunks can differ in size,
-     * and a plain average would over- or under-state progress.
+     * Overall completion = job units completed / job total units, as counted
+     * by the coordinator. The total includes work not yet handed to any
+     * worker, so the bar never jumps to 100% early. Not an average of the
+     * workers' percentages, which would ignore that chunks differ in size.
      */
     public double overallPercent() {
         if (state == State.COMPLETED) {
             return 100.0;
         }
-        long done = 0;
-        long total = 0;
-        for (WorkerProgress p : tasks.values()) {
-            done += p.unitsCompleted();
-            total += p.totalUnits();
+        ProgressSnapshot s = latest;
+        if (s == null || s.totalUnits() <= 0) {
+            return 0.0;
         }
-        return total == 0 ? 0.0 : Math.min(100.0, (done * 100.0) / total);
+        return Math.min(100.0, (s.unitsCompleted() * 100.0) / s.totalUnits());
+    }
+
+    /** Job-wide units done, 0 before the first snapshot. */
+    public long unitsCompleted() {
+        ProgressSnapshot s = latest;
+        return s == null ? 0 : s.unitsCompleted();
+    }
+
+    /** Job-wide total units, 0 before the first snapshot. */
+    public long totalUnits() {
+        ProgressSnapshot s = latest;
+        return s == null ? 0 : s.totalUnits();
     }
 
     /** Copy of the current per-worker rows, sorted by worker ID for display. */
     public List<WorkerProgress> workerBreakdown() {
-        List<WorkerProgress> rows = new ArrayList<>(tasks.values());
-        rows.sort(Comparator.comparingInt(WorkerProgress::workerId)
-                .thenComparing(WorkerProgress::taskId));
+        ProgressSnapshot s = latest;
+        if (s == null) {
+            return List.of();
+        }
+        List<WorkerProgress> rows = new ArrayList<>(s.workers());
+        rows.sort(Comparator.comparingInt(WorkerProgress::workerId));
         return rows;
     }
 

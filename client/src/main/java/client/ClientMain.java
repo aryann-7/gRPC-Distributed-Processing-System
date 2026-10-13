@@ -14,7 +14,8 @@ import javax.swing.UIManager;
  *   java client.ClientMain [clientId] [bootstrapHost] [bootstrapPort]
  *   defaults:               1          localhost       50050
  *
- * Run several at once (different IDs) to have multiple clients.
+ * Run several at once (different IDs) to have multiple clients. The client ID
+ * only labels the window; jobs are identified by their own UUID job IDs.
  */
 public class ClientMain {
 
@@ -35,7 +36,7 @@ public class ClientMain {
         }
 
         CoordinatorClientFactory factory = (host, port) -> new RetryingCoordinatorClient(
-                new GrpcCoordinatorClient(clientId, host, port, ChannelFactory.plaintext()),
+                new GrpcCoordinatorClient(host, port, ChannelFactory.plaintext()),
                 MAX_ATTEMPTS, RETRY_DELAY_MS);
 
         SwingUtilities.invokeLater(() ->

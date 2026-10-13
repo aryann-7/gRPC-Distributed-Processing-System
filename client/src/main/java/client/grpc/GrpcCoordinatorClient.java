@@ -3,12 +3,15 @@ package client.grpc;
 import client.api.CoordinatorClient;
 import client.api.JobProgressListener;
 import client.model.JobSpec;
-import common.grpc.client.ClusterDiscoveryGrpc;
-import common.grpc.client.CoordinatorEndpoint;
-import common.grpc.client.CoordinatorJobServiceGrpc;
-import common.grpc.client.CoordinatorQuery;
-import common.grpc.client.CoordinatorStatus;
-import common.grpc.client.StatusRequest;
+import common.grpc.BootstrapServiceGrpc;
+import common.grpc.CoordinatorRecord;
+import common.grpc.CoordinatorServiceGrpc;
+import common.grpc.GetCoordinatorRequest;
+import common.grpc.GetCoordinatorResponse;
+import common.grpc.GetCoordinatorStatusRequest;
+import common.grpc.GetCoordinatorStatusResponse;
+import common.grpc.WatchJobRequest;
+import common.grpc.WorkerEndpoint;
 import io.grpc.ManagedChannel;
 import io.grpc.StatusRuntimeException;
 import java.util.Map;
@@ -18,23 +21,28 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Talks to the cluster over gRPC.
+ * Talks to the cluster over gRPC, using the team's bootstrap.proto and
+ * coordinator.proto.
  *
  * For every job:
- *  1. Ask the Bootstrap (ClusterDiscovery.GetCoordinator) where the current
+ *  1. BootstrapService.GetCoordinator - ask the Bootstrap who the current
  *     coordinator is. Asked every time, because the coordinator changes
  *     after an election or a crash.
- *  2. Call CoordinatorJobService.SubmitJob on that coordinator and listen to
- *     the progress stream with a JobProgressStreamHandler.
+ *  2. CoordinatorService.SubmitJob    - hand the job to that coordinator.
+ *     It answers straight away; the job runs in the background.
+ *  3. CoordinatorService.WatchJob     - open the progress stream. The first
+ *     message is a full snapshot, then one message per change, ending with
+ *     COMPLETED or FAILED. JobProgressStreamHandler listens to it.
  *
- * submit() never blocks the caller: the blocking discovery step runs on a
- * background thread, and the job itself uses gRPC's asynchronous stub.
+ * submit() never blocks the caller: steps 1 and 2 are blocking unary calls
+ * (with deadlines) run on a background thread, and step 3 uses gRPC's
+ * asynchronous stub.
  */
 public class GrpcCoordinatorClient implements CoordinatorClient {
 
-    private static final long DISCOVERY_TIMEOUT_SECONDS = 3;
+    /** Deadline for the unary calls (GetCoordinator, SubmitJob, GetCoordinatorStatus). */
+    private static final long CALL_TIMEOUT_SECONDS = 3;
 
-    private final String clientId;
     private final String bootstrapHost;
     private final int bootstrapPort;
     private final ChannelFactory channelFactory;
@@ -43,15 +51,13 @@ public class GrpcCoordinatorClient implements CoordinatorClient {
     /** One reusable channel per coordinator address ("host:port"). */
     private final Map<String, ManagedChannel> coordinatorChannels = new ConcurrentHashMap<>();
 
-    private final ExecutorService discoveryPool = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "client-grpc-discovery");
+    private final ExecutorService callPool = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "client-grpc-calls");
         t.setDaemon(true);
         return t;
     });
 
-    public GrpcCoordinatorClient(String clientId, String bootstrapHost, int bootstrapPort,
-                                 ChannelFactory channelFactory) {
-        this.clientId = clientId;
+    public GrpcCoordinatorClient(String bootstrapHost, int bootstrapPort, ChannelFactory channelFactory) {
         this.bootstrapHost = bootstrapHost;
         this.bootstrapPort = bootstrapPort;
         this.channelFactory = channelFactory;
@@ -60,60 +66,85 @@ public class GrpcCoordinatorClient implements CoordinatorClient {
 
     @Override
     public void submit(JobSpec job, JobProgressListener listener) {
-        discoveryPool.execute(() -> {
-            CoordinatorEndpoint endpoint;
+        callPool.execute(() -> {
+            // 1. Discovery
+            CoordinatorRecord coordinator;
             try {
-                endpoint = discoverCoordinator();
+                coordinator = discoverCoordinator();
             } catch (StatusRuntimeException e) {
                 listener.onFailed("Bootstrap unreachable at " + bootstrapHost + ":" + bootstrapPort
-                        + " (" + e.getStatus().getCode() + ")",
+                        + " (" + JobProgressStreamHandler.describe(e.getStatus()) + ")",
                         JobProgressStreamHandler.isRetryable(e.getStatus().getCode()));
                 return;
             }
-            if (!endpoint.getAvailable()) {
-                listener.onFailed("No coordinator is elected yet", true);
+            if (coordinator == null) {
+                listener.onFailed("No coordinator has been elected yet", true);
                 return;
             }
 
-            String address = addressOf(endpoint);
-            ManagedChannel channel = channelFor(endpoint);
-            CoordinatorJobServiceGrpc.newStub(channel).submitJob(
-                    ProtoMapper.toSubmission(job, clientId),
+            String address = addressOf(coordinator);
+            ManagedChannel channel = channelFor(coordinator);
+
+            // 2. Submit (same job ID on every retry = "exact retry", no new work)
+            try {
+                CoordinatorServiceGrpc.newBlockingStub(channel)
+                        .withDeadlineAfter(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                        .submitJob(ProtoMapper.toRequest(job));
+            } catch (StatusRuntimeException e) {
+                boolean retryable = JobProgressStreamHandler.isRetryable(e.getStatus().getCode());
+                if (retryable) {
+                    dropChannel(address);
+                }
+                listener.onFailed("Coordinator Worker " + idOf(coordinator) + " did not accept the job ("
+                        + JobProgressStreamHandler.describe(e.getStatus()) + ")", retryable);
+                return;
+            }
+
+            // 3. Watch the progress stream
+            CoordinatorServiceGrpc.newStub(channel).watchJob(
+                    WatchJobRequest.newBuilder().setJobId(job.jobId()).build(),
                     new JobProgressStreamHandler(listener, () -> dropChannel(address)));
         });
     }
 
     @Override
     public String checkConnection() throws Exception {
-        CoordinatorEndpoint endpoint = discoverCoordinator();
-        if (!endpoint.getAvailable()) {
-            throw new IllegalStateException("Bootstrap is reachable, but no coordinator is elected yet");
+        CoordinatorRecord coordinator = discoverCoordinator();
+        if (coordinator == null) {
+            throw new IllegalStateException("Bootstrap is reachable, but no coordinator has been elected yet");
         }
-        CoordinatorStatus status = CoordinatorJobServiceGrpc.newBlockingStub(channelFor(endpoint))
-                .withDeadlineAfter(DISCOVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                .getStatus(StatusRequest.newBuilder().setClientId(clientId).build());
-        return String.format("Coordinator Worker %d at %s (term %d, %d active workers, %d jobs this term)",
-                status.getCoordinatorId(), addressOf(endpoint), status.getTerm(),
-                status.getActiveWorkers(), status.getJobsInTerm());
+        GetCoordinatorStatusResponse status = CoordinatorServiceGrpc.newBlockingStub(channelFor(coordinator))
+                .withDeadlineAfter(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .getCoordinatorStatus(GetCoordinatorStatusRequest.getDefaultInstance());
+        return String.format("Coordinator Worker %d at %s (term %d, %d of %d jobs used this term)",
+                status.getCoordinator().getWorkerId(), addressOf(coordinator), status.getTerm(),
+                status.getJobsInTerm(), status.getMaxJobsPerTerm());
     }
 
     @Override
     public void close() {
-        discoveryPool.shutdownNow();
+        callPool.shutdownNow();
         bootstrapChannel.shutdownNow();
         coordinatorChannels.values().forEach(ManagedChannel::shutdownNow);
         coordinatorChannels.clear();
     }
 
-    /** Blocking unary call to the Bootstrap, with a timeout. */
-    private CoordinatorEndpoint discoverCoordinator() {
-        return ClusterDiscoveryGrpc.newBlockingStub(bootstrapChannel)
-                .withDeadlineAfter(DISCOVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                .getCoordinator(CoordinatorQuery.newBuilder().setClientId(clientId).build());
+    /**
+     * Blocking unary call to the Bootstrap, with a deadline.
+     *
+     * @return the published coordinator, or null if none is published yet
+     *         (bootstrap.proto: an absent record is a normal answer)
+     */
+    private CoordinatorRecord discoverCoordinator() {
+        GetCoordinatorResponse response = BootstrapServiceGrpc.newBlockingStub(bootstrapChannel)
+                .withDeadlineAfter(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .getCoordinator(GetCoordinatorRequest.getDefaultInstance());
+        return response.hasCoordinator() ? response.getCoordinator() : null;
     }
 
-    private ManagedChannel channelFor(CoordinatorEndpoint endpoint) {
-        return coordinatorChannels.computeIfAbsent(addressOf(endpoint),
+    private ManagedChannel channelFor(CoordinatorRecord coordinator) {
+        WorkerEndpoint endpoint = coordinator.getCoordinator().getEndpoint();
+        return coordinatorChannels.computeIfAbsent(addressOf(coordinator),
                 key -> channelFactory.open(endpoint.getHost(), endpoint.getPort()));
     }
 
@@ -125,7 +156,12 @@ public class GrpcCoordinatorClient implements CoordinatorClient {
         }
     }
 
-    private static String addressOf(CoordinatorEndpoint endpoint) {
+    private static String addressOf(CoordinatorRecord coordinator) {
+        WorkerEndpoint endpoint = coordinator.getCoordinator().getEndpoint();
         return endpoint.getHost() + ":" + endpoint.getPort();
+    }
+
+    private static int idOf(CoordinatorRecord coordinator) {
+        return coordinator.getCoordinator().getIdentity().getWorkerId();
     }
 }

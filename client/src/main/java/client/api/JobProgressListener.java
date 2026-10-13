@@ -1,6 +1,6 @@
 package client.api;
 
-import client.progress.WorkerProgress;
+import client.progress.ProgressSnapshot;
 
 /**
  * Callbacks for one submitted job.
@@ -11,8 +11,8 @@ import client.progress.WorkerProgress;
  */
 public interface JobProgressListener {
 
-    /** A worker reported how much of its sub-task is done. */
-    void onProgress(WorkerProgress progress);
+    /** The coordinator sent a new full progress snapshot for the job. */
+    void onProgress(ProgressSnapshot snapshot);
 
     /** The job finished; result is the aggregated answer. */
     void onCompleted(long result);

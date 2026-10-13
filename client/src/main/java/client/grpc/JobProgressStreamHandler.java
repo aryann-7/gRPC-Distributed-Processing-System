@@ -1,18 +1,17 @@
 package client.grpc;
 
 import client.api.JobProgressListener;
-import common.grpc.client.JobProgress;
-import common.grpc.client.WorkerTaskProgress;
+import common.grpc.JobProgress;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Receives the coordinator's progress stream for ONE job and turns it into
+ * Receives the coordinator's WatchJob stream for ONE job and turns it into
  * listener calls. This is the client-side streaming listener.
  *
  * gRPC calls these methods on its own threads, one message at a time:
- *   onNext      - one JobProgress message (RUNNING, COMPLETED or FAILED)
+ *   onNext      - one JobProgress snapshot (QUEUED, RUNNING, COMPLETED or FAILED)
  *   onError     - the stream broke (e.g. the coordinator crashed)
  *   onCompleted - the coordinator closed the stream normally
  *
@@ -39,24 +38,30 @@ public class JobProgressStreamHandler implements StreamObserver<JobProgress> {
         if (finished.get()) {
             return;
         }
-        for (WorkerTaskProgress worker : message.getWorkersList()) {
-            listener.onProgress(ProtoMapper.fromProto(worker));
-        }
+        // Every message is a full snapshot, including the final one.
+        listener.onProgress(ProtoMapper.toSnapshot(message));
+
         switch (message.getState()) {
             case COMPLETED:
                 if (finished.compareAndSet(false, true)) {
-                    listener.onCompleted(message.getResultValue());
+                    if (message.hasResultValue()) {
+                        listener.onCompleted(message.getResultValue());
+                    } else {
+                        listener.onFailed("Coordinator reported COMPLETED without a result", false);
+                    }
                 }
                 break;
             case FAILED:
+                // A FAILED job is final: the coordinator itself decided it
+                // cannot be done (e.g. bad input), so the client does not retry.
                 if (finished.compareAndSet(false, true)) {
-                    String error = message.getErrorMessage().isEmpty()
-                            ? "Coordinator reported failure" : message.getErrorMessage();
-                    listener.onFailed(error, message.getRetryable());
+                    String error = message.hasErrorMessage() && !message.getErrorMessage().isEmpty()
+                            ? message.getErrorMessage() : "Coordinator reported failure";
+                    listener.onFailed(error, false);
                 }
                 break;
             default:
-                // RUNNING (or unspecified): progress only, already forwarded.
+                // QUEUED / RUNNING: progress only, already forwarded.
                 break;
         }
     }
@@ -71,31 +76,40 @@ public class JobProgressStreamHandler implements StreamObserver<JobProgress> {
         if (retryable) {
             onConnectionLost.run();
         }
-        String detail = status.getDescription() == null ? "" : " - " + status.getDescription();
-        listener.onFailed("Connection to coordinator lost (" + status.getCode() + detail + ")", retryable);
+        listener.onFailed("Connection to coordinator lost (" + describe(status) + ")", retryable);
     }
 
     @Override
     public void onCompleted() {
-        // A correct coordinator always sends COMPLETED or FAILED before closing.
+        // The coordinator always sends COMPLETED or FAILED before closing.
+        // A stream closed early does not cancel the job (coordinator.proto),
+        // so reconnecting with the same job ID is the right response.
         if (finished.compareAndSet(false, true)) {
             listener.onFailed("Coordinator closed the stream before the job finished", true);
         }
     }
 
     /**
-     * Transport problems where trying again (after a new coordinator is
-     * elected) is expected to work. Other codes mean a bug or bad input.
+     * Problems where trying again (after the cluster recovers or elects a new
+     * coordinator) is expected to work. Other codes mean a bug or bad input.
      */
     public static boolean isRetryable(Status.Code code) {
         switch (code) {
-            case UNAVAILABLE:        // coordinator process gone / not listening
-            case DEADLINE_EXCEEDED:  // did not answer in time
-            case ABORTED:            // coordinator gave up the job (e.g. stepping down)
-            case CANCELLED:          // stream cancelled by the server
+            case UNAVAILABLE:         // coordinator/bootstrap process gone or not listening
+            case DEADLINE_EXCEEDED:   // did not answer in time
+            case ABORTED:             // coordinator gave up the job (e.g. stepping down)
+            case CANCELLED:           // stream cancelled by the server
+            case FAILED_PRECONDITION: // coordinator.proto: "An inactive coordinator returns FAILED_PRECONDITION"
                 return true;
             default:
                 return false;
         }
+    }
+
+    /** "CODE" or "CODE - description", for log messages. */
+    static String describe(Status status) {
+        return status.getDescription() == null
+                ? status.getCode().toString()
+                : status.getCode() + " - " + status.getDescription();
     }
 }

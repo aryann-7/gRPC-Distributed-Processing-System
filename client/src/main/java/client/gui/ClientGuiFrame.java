@@ -8,7 +8,7 @@ import client.model.JobKind;
 import client.model.JobSpec;
 import client.parser.CsvDataParser;
 import client.progress.JobProgressTracker;
-import client.progress.WorkerProgress;
+import client.progress.ProgressSnapshot;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Dimension;
@@ -333,8 +333,8 @@ public class ClientGuiFrame extends JFrame {
         }
 
         @Override
-        public void onProgress(WorkerProgress progress) {
-            tracker.update(progress);
+        public void onProgress(ProgressSnapshot snapshot) {
+            tracker.apply(snapshot);
             jobsPanel.refresh();
         }
 

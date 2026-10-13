@@ -1,13 +1,13 @@
 package client.progress;
 
 /**
- * Snapshot of one worker's sub-task for one job.
+ * One worker's share of a job, as reported by the coordinator
+ * (WorkerJobProgress in coordinator.proto).
  *
  * Progress is measured in work units (numbers checked, or range values
- * evaluated) as reported by the worker, never by a timer.
+ * evaluated) as reported by the workers, never by a timer.
  */
-public record WorkerProgress(int workerId, String taskId,
-                             long unitsCompleted, long totalUnits, String status) {
+public record WorkerProgress(int workerId, long unitsCompleted, long totalUnits) {
 
     /** This worker's own completion, 0-100. */
     public double percent() {
@@ -15,5 +15,10 @@ public record WorkerProgress(int workerId, String taskId,
             return 0.0;
         }
         return Math.min(100.0, (unitsCompleted * 100.0) / totalUnits);
+    }
+
+    /** True once the worker has processed all of its units. */
+    public boolean isDone() {
+        return totalUnits > 0 && unitsCompleted >= totalUnits;
     }
 }

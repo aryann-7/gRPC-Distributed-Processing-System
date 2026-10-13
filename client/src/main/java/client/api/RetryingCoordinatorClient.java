@@ -1,7 +1,7 @@
 package client.api;
 
 import client.model.JobSpec;
-import client.progress.WorkerProgress;
+import client.progress.ProgressSnapshot;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -11,9 +11,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Wraps any CoordinatorClient and resubmits a job after a retryable failure,
  * e.g. the coordinator crashed or is being replaced by a new election.
  *
- * Works the same for RMI and gRPC because it only uses the interface.
- * The resubmission keeps the same job ID, so a coordinator that remembers
- * job IDs can recognise it as the same job.
+ * It only uses the CoordinatorClient interface, so it is tested without a
+ * network. Every retry reuses the SAME JobSpec, so the job ID never changes.
+ * coordinator.proto makes SubmitJob with a known ID an "exact retry" that
+ * starts no new work, so retrying cannot run a job twice; the client then
+ * re-attaches to the job's progress stream (WatchJob).
  */
 public class RetryingCoordinatorClient implements CoordinatorClient {
 
@@ -47,9 +49,9 @@ public class RetryingCoordinatorClient implements CoordinatorClient {
 
         delegate.submit(job, new JobProgressListener() {
             @Override
-            public void onProgress(WorkerProgress progress) {
+            public void onProgress(ProgressSnapshot snapshot) {
                 if (!finished.get()) {
-                    listener.onProgress(progress);
+                    listener.onProgress(snapshot);
                 }
             }
 

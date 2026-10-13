@@ -15,13 +15,15 @@ import javax.swing.table.AbstractTableModel;
 
 /**
  * Pop-up opened by clicking a job's progress bar. Shows one row per worker
- * sub-task. A Swing Timer re-reads the tracker so the dialog stays live; the
- * timer only repaints, it never changes any progress value.
+ * that received part of the job. A Swing Timer re-reads the tracker so the
+ * dialog stays live; the timer only repaints, it never changes any progress
+ * value.
  */
 public class WorkerBreakdownDialog extends JDialog {
 
     private static final int REFRESH_MS = 250;
-    private static final String[] COLUMNS = {"Worker", "Task", "Units done", "Total units", "Progress", "Status"};
+    private static final int COL_PROGRESS = 3;
+    private static final String[] COLUMNS = {"Worker", "Units done", "Total units", "Progress", "Status"};
 
     private final JobProgressTracker job;
     private List<WorkerProgress> rows;
@@ -32,16 +34,15 @@ public class WorkerBreakdownDialog extends JDialog {
         @Override public int getRowCount() { return rows.size(); }
         @Override public int getColumnCount() { return COLUMNS.length; }
         @Override public String getColumnName(int c) { return COLUMNS[c]; }
-        @Override public Class<?> getColumnClass(int c) { return c == 4 ? Double.class : Object.class; }
+        @Override public Class<?> getColumnClass(int c) { return c == COL_PROGRESS ? Double.class : Object.class; }
         @Override public Object getValueAt(int r, int c) {
             WorkerProgress p = rows.get(r);
             switch (c) {
                 case 0: return "Worker " + p.workerId();
-                case 1: return p.taskId();
-                case 2: return p.unitsCompleted();
-                case 3: return p.totalUnits();
-                case 4: return p.percent();
-                case 5: return p.status();
+                case 1: return p.unitsCompleted();
+                case 2: return p.totalUnits();
+                case 3: return p.percent();
+                case 4: return p.isDone() ? "Done" : "Working";
                 default: return "";
             }
         }
@@ -53,7 +54,7 @@ public class WorkerBreakdownDialog extends JDialog {
         this.rows = job.workerBreakdown();
 
         JTable table = new JTable(model);
-        table.getColumnModel().getColumn(4).setCellRenderer(new ProgressBarRenderer());
+        table.getColumnModel().getColumn(COL_PROGRESS).setCellRenderer(new ProgressBarRenderer());
         table.setRowHeight(22);
 
         summary.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
@@ -72,8 +73,9 @@ public class WorkerBreakdownDialog extends JDialog {
     private void reload() {
         rows = job.workerBreakdown();
         model.fireTableDataChanged();
-        summary.setText(String.format("%s  |  %s  |  overall %.1f%%  |  %d sub-task(s)",
-                job.getJobType(), job.getState(), job.overallPercent(), rows.size()));
+        summary.setText(String.format("%s  |  %s  |  overall %.1f%% (%d of %d units)  |  %d worker(s)",
+                job.getJobType(), job.getState(), job.overallPercent(),
+                job.unitsCompleted(), job.totalUnits(), rows.size()));
         if (job.isFinished()) {
             refreshTimer.stop();
         }
