@@ -26,6 +26,11 @@ message TaskDispatchRequest {
     // For PRIMESUM (range-based partitioning)
     int64 range_start = 5;
     int64 range_end = 6;
+
+    // Both zero means legacy; new assignments use positive terms and attempt 1.
+    // Retries increment attempt but keep job_id/task_id; duplicate sends keep it.
+    int32 attempt = 7;
+    int32 coordinator_term = 8;
 }
 
 // Real-time progress update event streamed from Worker to Coordinator
@@ -40,6 +45,12 @@ message TaskProgressUpdate {
     int64 total_units = 6;          // total chunk size or range span
     string status_message = 7;      // "PROCESSING", "COMPLETED", "FAILED"
     int64 timestamp_ms = 8;
+
+    // Present once at termination; absent on ordinary progress updates.
+    // IDs, attempt and term must match the enclosing update.
+    TaskResultResponse final_result = 9;
+    int32 attempt = 10;
+    int32 coordinator_term = 11;
 }
 
 // Final result returned when task execution completes
@@ -51,6 +62,12 @@ message TaskResultResponse {
     int64 result_value = 5;
     string error_message = 6;
     int64 execution_time_ms = 7;
+
+    // Echo the dispatch identity; schedulers reject stale attempts/terms.
+    int32 attempt = 8;
+    int32 coordinator_term = 9;
+    // Cancellation requires success=false; otherwise success=false means failure.
+    bool cancelled = 10;
 }
 
 // Health check / Heartbeat request (used by Coordinator to detect active, slow, dead workers)
@@ -78,12 +95,21 @@ message CancelTaskRequest {
     string job_id = 1;
     string task_id = 2;
     string reason = 3;
+
+    // Target this exact assignment so a delayed cancellation cannot stop its retry.
+    // Zero attempt/term retains legacy cancellation behaviour.
+    int32 attempt = 4;
+    int32 coordinator_term = 5;
 }
 
 message CancelTaskResponse {
     string task_id = 1;
     bool cancelled = 2;
     string message = 3;
+
+    // Echo the cancellation request, even when the assignment was not found.
+    int32 attempt = 4;
+    int32 coordinator_term = 5;
 }
 
 // gRPC Service hosted by each Worker Node
