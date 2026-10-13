@@ -5,8 +5,8 @@ import client.model.JobSpec;
 /**
  * How the client talks to the cluster's coordinator.
  *
- * The GUI only uses this interface, so swapping RMI for gRPC means adding
- * one new implementation; no GUI code changes. Implementations must:
+ * The GUI only uses this interface, so it does not depend on gRPC classes,
+ * and tests can plug in a fake. Implementations must:
  * - return from submit() immediately (never block the caller), and
  * - report the outcome through the listener on their own threads.
  */

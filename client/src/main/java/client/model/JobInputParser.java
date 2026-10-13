@@ -16,9 +16,13 @@ public final class JobInputParser {
     private JobInputParser() {
     }
 
-    /** New short job ID, e.g. "job-3f9a21c4". */
+    /**
+     * New job ID: "job-" plus a full random UUID. coordinator.proto asks for a
+     * client-generated ID (preferably a full UUID) that is reused on retries,
+     * so IDs from several clients never clash.
+     */
     public static String newJobId() {
-        return "job-" + UUID.randomUUID().toString().substring(0, 8);
+        return "job-" + UUID.randomUUID();
     }
 
     /** Parses "10, 25 3,99" style input. Throws with the first bad token named. */
