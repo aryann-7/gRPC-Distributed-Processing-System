@@ -3,6 +3,7 @@ package bootstrap;
 import common.grpc.WorkerDescriptor;
 import common.grpc.WorkerEndpoint;
 import common.grpc.WorkerIdentity;
+import common.grpc.MembershipSnapshot;
 
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -13,12 +14,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 public final class WorkerRegistry {
     // One lock keeps membership checks, changes and snapshots consistent.
     private final Map<Integer, WorkerDescriptor> workers = new HashMap<>();
     private final int maxNeighbours;
+    private final String epoch = UUID.randomUUID().toString();
+    private long revision;
 
     public WorkerRegistry() {
         this(Integer.getInteger("cs324.maxNeighbors", 2));
@@ -40,6 +44,7 @@ public final class WorkerRegistry {
             return false;
         }
         workers.put(id, worker);
+        revision++;
         return true;
     }
 
@@ -52,6 +57,15 @@ public final class WorkerRegistry {
         return List.copyOf(workers.values());
     }
 
+    public String getEpoch() {
+        return epoch;
+    }
+
+    public synchronized MembershipSnapshot membershipSnapshot() {
+        return MembershipSnapshot.newBuilder().setRegistryEpoch(epoch)
+                .setMembershipRevision(revision).addAllWorkers(workers.values()).build();
+    }
+
     public synchronized boolean deregisterWorker(WorkerIdentity identity) {
         validateIdentity(identity);
         WorkerDescriptor existing = workers.get(identity.getWorkerId());
@@ -60,6 +74,7 @@ public final class WorkerRegistry {
         }
         requireSession(identity, existing);
         workers.remove(identity.getWorkerId());
+        revision++;
         return true;
     }
 
