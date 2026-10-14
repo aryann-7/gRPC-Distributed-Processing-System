@@ -62,6 +62,35 @@ public final class BootstrapGrpcService extends BootstrapServiceGrpc.BootstrapSe
                 () -> ListWorkersResponse.newBuilder().setSnapshot(registry.membershipSnapshot()).build());
     }
 
+    @Override
+    public void publishCoordinator(PublishCoordinatorRequest request,
+                                   StreamObserver<PublishCoordinatorResponse> observer) {
+        respond(observer, Status.FAILED_PRECONDITION, () -> {
+            boolean updated = registry.publishCoordinator(request.getCoordinator(), request.getRegistryEpoch());
+            return PublishCoordinatorResponse.newBuilder().setCoordinator(request.getCoordinator())
+                    .setUpdated(updated).setRegistryEpoch(registry.getEpoch()).build();
+        });
+    }
+
+    @Override
+    public void getCoordinator(GetCoordinatorRequest request, StreamObserver<GetCoordinatorResponse> observer) {
+        respond(observer, Status.FAILED_PRECONDITION, () -> {
+            var response = GetCoordinatorResponse.newBuilder().setRegistryEpoch(registry.getEpoch());
+            registry.getCoordinator().ifPresent(response::setCoordinator);
+            return response.build();
+        });
+    }
+
+    @Override
+    public void clearCoordinator(ClearCoordinatorRequest request, StreamObserver<ClearCoordinatorResponse> observer) {
+        respond(observer, Status.FAILED_PRECONDITION, () -> {
+            boolean cleared = registry.clearCoordinator(request.getCoordinator(), request.getTerm(),
+                    request.getRegistryEpoch());
+            return ClearCoordinatorResponse.newBuilder().setCleared(cleared)
+                    .setRegistryEpoch(registry.getEpoch()).build();
+        });
+    }
+
     private void requireEpoch(String epoch) {
         if (!registry.getEpoch().equals(epoch)) {
             throw Status.FAILED_PRECONDITION.withDescription("Registry epoch does not match").asRuntimeException();

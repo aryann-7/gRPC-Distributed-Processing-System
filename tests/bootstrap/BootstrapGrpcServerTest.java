@@ -127,9 +127,6 @@ public class BootstrapGrpcServerTest {
     public void deferredMethodsRemainUnimplemented() {
         assertStatus(Status.Code.UNIMPLEMENTED, () -> stub.renewLease(RenewLeaseRequest.getDefaultInstance()));
         assertStatus(Status.Code.UNIMPLEMENTED, () -> stub.watchMembership(WatchMembershipRequest.getDefaultInstance()).hasNext());
-        assertStatus(Status.Code.UNIMPLEMENTED, () -> stub.getCoordinator(GetCoordinatorRequest.getDefaultInstance()));
-        assertStatus(Status.Code.UNIMPLEMENTED, () -> stub.publishCoordinator(PublishCoordinatorRequest.getDefaultInstance()));
-        assertStatus(Status.Code.UNIMPLEMENTED, () -> stub.clearCoordinator(ClearCoordinatorRequest.getDefaultInstance()));
     }
 
     @Test
@@ -141,6 +138,113 @@ public class BootstrapGrpcServerTest {
             assertEquals(port, replacement.getPort());
         }
         assertTrue(channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    public void discoveryWithoutCoordinatorReturnsAnAbsentRecordAndEpoch() {
+        GetCoordinatorResponse response = stub.getCoordinator(GetCoordinatorRequest.getDefaultInstance());
+        assertFalse(response.hasCoordinator());
+        assertEquals(registry.getEpoch(), response.getRegistryEpoch());
+        assertFalse(clear(worker(101, "session").getIdentity(), 1).getCleared());
+    }
+
+    @Test
+    public void publicationDiscoveryAndRetryPreserveTheRegisteredDescriptor() {
+        WorkerDescriptor worker = worker(101, "session");
+        RegisterWorkerResponse registration = register(worker);
+        CoordinatorRecord record = CoordinatorRecord.newBuilder().setCoordinator(worker).setTerm(2).build();
+        PublishCoordinatorResponse published = publish(record);
+        assertTrue(published.getUpdated());
+        assertEquals(record, published.getCoordinator());
+        assertEquals(registration.getRegistryEpoch(), published.getRegistryEpoch());
+        GetCoordinatorResponse discovered = stub.getCoordinator(GetCoordinatorRequest.getDefaultInstance());
+        assertEquals(record, discovered.getCoordinator());
+        assertEquals(registration.getRegistryEpoch(), discovered.getRegistryEpoch());
+        assertFalse(publish(record).getUpdated());
+        assertEquals(record, stub.getCoordinator(GetCoordinatorRequest.getDefaultInstance()).getCoordinator());
+        assertEquals(1, stub.listWorkers(ListWorkersRequest.getDefaultInstance()).getSnapshot().getMembershipRevision());
+    }
+
+    @Test
+    public void invalidCoordinatorRequestsAndStaleRegistrationsAreRejected() {
+        assertStatus(Status.Code.INVALID_ARGUMENT,
+                () -> stub.publishCoordinator(PublishCoordinatorRequest.getDefaultInstance()));
+        assertStatus(Status.Code.INVALID_ARGUMENT,
+                () -> stub.clearCoordinator(ClearCoordinatorRequest.getDefaultInstance()));
+        WorkerDescriptor worker = worker(101, "current");
+        CoordinatorRecord record = CoordinatorRecord.newBuilder().setCoordinator(worker).setTerm(1).build();
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> publish(record));
+        register(worker);
+        assertStatus(Status.Code.INVALID_ARGUMENT, () -> publish(record.toBuilder().setTerm(0).build()));
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> publish(record.toBuilder()
+                .setCoordinator(worker(101, "old")).build()));
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> publish(record.toBuilder()
+                .setCoordinator(worker.toBuilder().setEndpoint(worker.getEndpoint().toBuilder().setPort(1201))).build()));
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> stub.publishCoordinator(PublishCoordinatorRequest.newBuilder()
+                .setCoordinator(record).setRegistryEpoch("old-epoch").build()));
+        assertFalse(stub.getCoordinator(GetCoordinatorRequest.getDefaultInstance()).hasCoordinator());
+    }
+
+    @Test
+    public void newerElectionReplacesCoordinatorAndRejectsStaleClearing() {
+        WorkerDescriptor first = worker(101, "first"), second = worker(102, "second");
+        register(first);
+        register(second);
+        CoordinatorRecord old = CoordinatorRecord.newBuilder().setCoordinator(first).setTerm(2).build();
+        CoordinatorRecord current = CoordinatorRecord.newBuilder().setCoordinator(second).setTerm(3).build();
+        publish(old);
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> publish(current.toBuilder().setTerm(1).build()));
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> publish(current.toBuilder().setTerm(2).build()));
+        assertTrue(publish(current).getUpdated());
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> clear(first.getIdentity(), 2));
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> clear(worker(102, "old-session").getIdentity(), 3));
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> clear(second.getIdentity(), 2));
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> stub.clearCoordinator(ClearCoordinatorRequest.newBuilder()
+                .setCoordinator(second.getIdentity()).setTerm(3).setRegistryEpoch("old-epoch").build()));
+        assertEquals(current, stub.getCoordinator(GetCoordinatorRequest.getDefaultInstance()).getCoordinator());
+    }
+
+    @Test
+    public void clearingIsIdempotentAndRetainsTheTermWatermark() {
+        WorkerDescriptor worker = worker(101, "session");
+        register(worker);
+        CoordinatorRecord record = CoordinatorRecord.newBuilder().setCoordinator(worker).setTerm(3).build();
+        publish(record);
+        ClearCoordinatorResponse cleared = clear(worker.getIdentity(), 3);
+        assertTrue(cleared.getCleared());
+        assertEquals(registry.getEpoch(), cleared.getRegistryEpoch());
+        assertFalse(clear(worker.getIdentity(), 3).getCleared());
+        assertFalse(stub.getCoordinator(GetCoordinatorRequest.getDefaultInstance()).hasCoordinator());
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> publish(record));
+        assertTrue(publish(record.toBuilder().setTerm(4).build()).getUpdated());
+        assertEquals(1, stub.listWorkers(ListWorkersRequest.getDefaultInstance()).getSnapshot().getMembershipRevision());
+    }
+
+    @Test
+    public void deregistrationRemovesDiscoveryAndFencesThePreviousSession() {
+        WorkerDescriptor worker = worker(101, "old");
+        register(worker);
+        CoordinatorRecord record = CoordinatorRecord.newBuilder().setCoordinator(worker).setTerm(3).build();
+        publish(record);
+        assertTrue(deregister(worker.getIdentity()).getRemoved());
+        assertFalse(stub.getCoordinator(GetCoordinatorRequest.getDefaultInstance()).hasCoordinator());
+        WorkerDescriptor replacement = worker(101, "new");
+        register(replacement);
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> publish(record.toBuilder().setTerm(4).build()));
+        assertStatus(Status.Code.FAILED_PRECONDITION, () -> publish(record.toBuilder().setCoordinator(replacement).build()));
+        assertTrue(publish(record.toBuilder().setCoordinator(replacement).setTerm(4).build()).getUpdated());
+        assertEquals(replacement, stub.getCoordinator(GetCoordinatorRequest.getDefaultInstance())
+                .getCoordinator().getCoordinator());
+    }
+
+    private PublishCoordinatorResponse publish(CoordinatorRecord coordinator) {
+        return stub.publishCoordinator(PublishCoordinatorRequest.newBuilder().setCoordinator(coordinator)
+                .setRegistryEpoch(registry.getEpoch()).build());
+    }
+
+    private ClearCoordinatorResponse clear(WorkerIdentity coordinator, int term) {
+        return stub.clearCoordinator(ClearCoordinatorRequest.newBuilder().setCoordinator(coordinator)
+                .setTerm(term).setRegistryEpoch(registry.getEpoch()).build());
     }
 
     private RegisterWorkerResponse register(WorkerDescriptor worker) {
