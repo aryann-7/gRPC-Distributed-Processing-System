@@ -4,6 +4,7 @@ import common.grpc.WorkerDescriptor;
 import common.grpc.WorkerEndpoint;
 import common.grpc.WorkerIdentity;
 import common.grpc.MembershipSnapshot;
+import common.grpc.CoordinatorRecord;
 
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -23,6 +24,8 @@ public final class WorkerRegistry {
     private final int maxNeighbours;
     private final String epoch = UUID.randomUUID().toString();
     private long revision;
+    private CoordinatorRecord coordinator;
+    private int highestCoordinatorTerm;
 
     public WorkerRegistry() {
         this(Integer.getInteger("cs324.maxNeighbors", 2));
@@ -66,6 +69,59 @@ public final class WorkerRegistry {
                 .setMembershipRevision(revision).addAllWorkers(workers.values()).build();
     }
 
+    public synchronized Optional<CoordinatorRecord> getCoordinator() {
+        return Optional.ofNullable(coordinator);
+    }
+
+    public synchronized boolean publishCoordinator(CoordinatorRecord record, String registryEpoch) {
+        if (record == null || !record.hasCoordinator()) {
+            throw new IllegalArgumentException("Coordinator descriptor is required");
+        }
+        validateWorker(record.getCoordinator());
+        validateTerm(record.getTerm());
+        requireEpoch(registryEpoch);
+        WorkerDescriptor registered = workers.get(record.getCoordinator().getIdentity().getWorkerId());
+        if (!record.getCoordinator().equals(registered)) {
+            throw new IllegalStateException("Coordinator must match a registered worker session and endpoint");
+        }
+        if (record.equals(coordinator)) {
+            return false;
+        }
+        if (record.getTerm() <= highestCoordinatorTerm) {
+            throw new IllegalStateException("Coordinator term must be newer than the last publication");
+        }
+        coordinator = record;
+        highestCoordinatorTerm = record.getTerm();
+        return true;
+    }
+
+    public synchronized boolean clearCoordinator(WorkerIdentity identity, int term, String registryEpoch) {
+        validateIdentity(identity);
+        validateTerm(term);
+        requireEpoch(registryEpoch);
+        if (coordinator == null) {
+            return false;
+        }
+        if (!coordinator.getCoordinator().getIdentity().equals(identity) || coordinator.getTerm() != term) {
+            throw new IllegalStateException("Coordinator identity and term do not match");
+        }
+        // Keep the term watermark so a delayed publication cannot restore it.
+        coordinator = null;
+        return true;
+    }
+
+    private void requireEpoch(String registryEpoch) {
+        if (!epoch.equals(registryEpoch)) {
+            throw new IllegalStateException("Registry epoch does not match");
+        }
+    }
+
+    private static void validateTerm(int term) {
+        if (term <= 0) {
+            throw new IllegalArgumentException("Coordinator term must be greater than zero");
+        }
+    }
+
     public synchronized boolean deregisterWorker(WorkerIdentity identity) {
         validateIdentity(identity);
         WorkerDescriptor existing = workers.get(identity.getWorkerId());
@@ -74,6 +130,9 @@ public final class WorkerRegistry {
         }
         requireSession(identity, existing);
         workers.remove(identity.getWorkerId());
+        if (coordinator != null && coordinator.getCoordinator().getIdentity().getWorkerId() == identity.getWorkerId()) {
+            coordinator = null;
+        }
         revision++;
         return true;
     }
