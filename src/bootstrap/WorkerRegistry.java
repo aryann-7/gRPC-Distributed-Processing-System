@@ -5,22 +5,29 @@ import common.grpc.WorkerEndpoint;
 import common.grpc.WorkerIdentity;
 import common.grpc.MembershipSnapshot;
 import common.grpc.CoordinatorRecord;
+import common.grpc.MembershipChange;
+import common.grpc.MembershipUpdate;
 
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 public final class WorkerRegistry {
+    private static final int MAX_PENDING_UPDATES = 256;
     // One lock keeps membership checks, changes and snapshots consistent.
     private final Map<Integer, WorkerDescriptor> workers = new HashMap<>();
+    private final Set<MembershipWatch> watches = new HashSet<>();
     private final int maxNeighbours;
     private final String epoch = UUID.randomUUID().toString();
     private long revision;
@@ -47,7 +54,7 @@ public final class WorkerRegistry {
             return false;
         }
         workers.put(id, worker);
-        revision++;
+        membershipChanged(MembershipChange.Kind.JOINED, worker);
         return true;
     }
 
@@ -67,6 +74,63 @@ public final class WorkerRegistry {
     public synchronized MembershipSnapshot membershipSnapshot() {
         return MembershipSnapshot.newBuilder().setRegistryEpoch(epoch)
                 .setMembershipRevision(revision).addAllWorkers(workers.values()).build();
+    }
+
+    public synchronized MembershipWatch watchMembership() {
+        MembershipWatch watch = new MembershipWatch();
+        // Capture and subscribe under the same lock so no join can fall between them.
+        watch.pending.add(MembershipUpdate.newBuilder().setSnapshot(membershipSnapshot()).build());
+        watches.add(watch);
+        return watch;
+    }
+
+    private void membershipChanged(MembershipChange.Kind kind, WorkerDescriptor worker) {
+        MembershipUpdate update = MembershipUpdate.newBuilder().setChange(MembershipChange.newBuilder()
+                .setKind(kind).setWorker(worker).setRegistryEpoch(epoch).setMembershipRevision(++revision)).build();
+        var iterator = watches.iterator();
+        while (iterator.hasNext()) {
+            MembershipWatch watch = iterator.next();
+            if (watch.pending.size() == MAX_PENDING_UPDATES) {
+                watch.overflowed = true;
+                watch.closed = true;
+                watch.pending.clear();
+                iterator.remove();
+            } else {
+                watch.pending.add(update);
+            }
+        }
+        notifyAll();
+    }
+
+    public final class MembershipWatch implements AutoCloseable {
+        private final ArrayDeque<MembershipUpdate> pending = new ArrayDeque<>();
+        private boolean closed;
+        private boolean overflowed;
+
+        private MembershipWatch() {}
+
+        // Empty means closed; overflow requires a fresh snapshot and subscription.
+        public Optional<MembershipUpdate> nextUpdate() throws InterruptedException {
+            synchronized (WorkerRegistry.this) {
+                while (pending.isEmpty() && !closed) {
+                    WorkerRegistry.this.wait();
+                }
+                if (overflowed) {
+                    throw new IllegalStateException("Membership watch overflowed; subscribe again");
+                }
+                return Optional.ofNullable(pending.poll());
+            }
+        }
+
+        @Override
+        public void close() {
+            synchronized (WorkerRegistry.this) {
+                watches.remove(this);
+                closed = true;
+                pending.clear();
+                WorkerRegistry.this.notifyAll();
+            }
+        }
     }
 
     public synchronized Optional<CoordinatorRecord> getCoordinator() {
@@ -133,7 +197,7 @@ public final class WorkerRegistry {
         if (coordinator != null && coordinator.getCoordinator().getIdentity().getWorkerId() == identity.getWorkerId()) {
             coordinator = null;
         }
-        revision++;
+        membershipChanged(MembershipChange.Kind.LEFT, existing);
         return true;
     }
 
