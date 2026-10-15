@@ -84,6 +84,10 @@ public final class WorkerRegistry {
         return watch;
     }
 
+    synchronized int membershipWatchCount() {
+        return watches.size();
+    }
+
     private void membershipChanged(MembershipChange.Kind kind, WorkerDescriptor worker) {
         MembershipUpdate update = MembershipUpdate.newBuilder().setChange(MembershipChange.newBuilder()
                 .setKind(kind).setWorker(worker).setRegistryEpoch(epoch).setMembershipRevision(++revision)).build();
@@ -106,19 +110,27 @@ public final class WorkerRegistry {
         private final ArrayDeque<MembershipUpdate> pending = new ArrayDeque<>();
         private boolean closed;
         private boolean overflowed;
+        private boolean paused;
 
         private MembershipWatch() {}
 
         // Empty means closed; overflow requires a fresh snapshot and subscription.
         public Optional<MembershipUpdate> nextUpdate() throws InterruptedException {
             synchronized (WorkerRegistry.this) {
-                while (pending.isEmpty() && !closed) {
+                while ((pending.isEmpty() || paused) && !closed) {
                     WorkerRegistry.this.wait();
                 }
                 if (overflowed) {
                     throw new IllegalStateException("Membership watch overflowed; subscribe again");
                 }
                 return Optional.ofNullable(pending.poll());
+            }
+        }
+
+        public void setPaused(boolean paused) {
+            synchronized (WorkerRegistry.this) {
+                this.paused = paused;
+                WorkerRegistry.this.notifyAll();
             }
         }
 

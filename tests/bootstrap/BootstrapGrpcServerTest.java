@@ -126,7 +126,6 @@ public class BootstrapGrpcServerTest {
     @Test
     public void deferredMethodsRemainUnimplemented() {
         assertStatus(Status.Code.UNIMPLEMENTED, () -> stub.renewLease(RenewLeaseRequest.getDefaultInstance()));
-        assertStatus(Status.Code.UNIMPLEMENTED, () -> stub.watchMembership(WatchMembershipRequest.getDefaultInstance()).hasNext());
     }
 
     @Test

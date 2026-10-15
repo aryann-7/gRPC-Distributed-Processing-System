@@ -178,6 +178,18 @@ public class MembershipTrackingTest {
         }
     }
 
+    @Test
+    public void pausedWatcherStillDetectsOverflow() throws Exception {
+        try (var watch = registry.watchMembership()) {
+            watch.setPaused(true);
+            for (int id = 1; id <= 300; id++) {
+                registry.registerWorker(worker(id, "session"));
+            }
+            assertThrows(IllegalStateException.class, watch::nextUpdate);
+            assertEquals(0, registry.membershipWatchCount());
+        }
+    }
+
     private void assertChange(MembershipUpdate update, MembershipChange.Kind kind,
                               WorkerDescriptor worker, long revision) {
         assertTrue(update.hasChange());

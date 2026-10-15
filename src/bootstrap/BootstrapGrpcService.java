@@ -4,13 +4,21 @@ import common.grpc.*;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
+import io.grpc.stub.ServerCallStreamObserver;
 
 import java.util.NoSuchElementException;
 import java.util.Objects;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
-public final class BootstrapGrpcService extends BootstrapServiceGrpc.BootstrapServiceImplBase {
+public final class BootstrapGrpcService extends BootstrapServiceGrpc.BootstrapServiceImplBase implements AutoCloseable {
     private final WorkerRegistry registry;
+    // One reader per stream, with no queue of waiting streaming tasks.
+    private final ThreadPoolExecutor streams = new ThreadPoolExecutor(0, 16, 30, TimeUnit.SECONDS,
+            new SynchronousQueue<>(), task -> new Thread(task, "bootstrap-membership"));
 
     public BootstrapGrpcService(WorkerRegistry registry) {
         this.registry = Objects.requireNonNull(registry);
@@ -60,6 +68,64 @@ public final class BootstrapGrpcService extends BootstrapServiceGrpc.BootstrapSe
     public void listWorkers(ListWorkersRequest request, StreamObserver<ListWorkersResponse> observer) {
         respond(observer, Status.FAILED_PRECONDITION,
                 () -> ListWorkersResponse.newBuilder().setSnapshot(registry.membershipSnapshot()).build());
+    }
+
+    @Override
+    public void watchMembership(WatchMembershipRequest request, StreamObserver<MembershipUpdate> observer) {
+        var call = (ServerCallStreamObserver<MembershipUpdate>) observer;
+        var watch = registry.watchMembership();
+        Object readiness = new Object();
+        call.setOnCancelHandler(watch::close);
+        call.setOnReadyHandler(() -> {
+            synchronized (readiness) {
+                watch.setPaused(false);
+            }
+        });
+        try {
+            streams.execute(() -> {
+                try (watch) {
+                    while (!call.isCancelled()) {
+                        synchronized (readiness) {
+                            watch.setPaused(!call.isReady());
+                        }
+                        var update = watch.nextUpdate();
+                        if (update.isEmpty() || call.isCancelled()) {
+                            return;
+                        }
+                        call.onNext(update.get());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    if (!call.isCancelled()) {
+                        call.onError(Status.UNAVAILABLE.withDescription("Bootstrap is shutting down").asRuntimeException());
+                    }
+                } catch (IllegalStateException e) {
+                    if (!call.isCancelled()) {
+                        call.onError(Status.RESOURCE_EXHAUSTED.withDescription(e.getMessage()).asRuntimeException());
+                    }
+                } catch (RuntimeException e) {
+                    if (!call.isCancelled()) {
+                        call.onError(Status.INTERNAL.withDescription("Membership stream failed").asRuntimeException());
+                    }
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            watch.close();
+            if (!call.isCancelled()) {
+                Status status = streams.isShutdown() ? Status.UNAVAILABLE : Status.RESOURCE_EXHAUSTED;
+                call.onError(status.withDescription("Membership streaming capacity unavailable").asRuntimeException());
+            }
+        }
+    }
+
+    @Override
+    public void close() {
+        streams.shutdownNow();
+        try {
+            streams.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override

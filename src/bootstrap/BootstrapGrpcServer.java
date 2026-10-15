@@ -8,6 +8,7 @@ import java.util.concurrent.TimeUnit;
 
 public final class BootstrapGrpcServer implements AutoCloseable {
     private final Server server;
+    private final BootstrapGrpcService service;
 
     public BootstrapGrpcServer(int port) {
         this(port, new WorkerRegistry());
@@ -17,7 +18,8 @@ public final class BootstrapGrpcServer implements AutoCloseable {
         if (port < 0 || port > 65535) {
             throw new IllegalArgumentException("Port must be between 0 and 65535");
         }
-        server = ServerBuilder.forPort(port).addService(new BootstrapGrpcService(registry)).build();
+        service = new BootstrapGrpcService(registry);
+        server = ServerBuilder.forPort(port).addService(service).build();
     }
 
     public void start() throws IOException {
@@ -36,6 +38,7 @@ public final class BootstrapGrpcServer implements AutoCloseable {
     @Override
     public void close() {
         server.shutdown();
+        service.close();
         try {
             if (!server.awaitTermination(5, TimeUnit.SECONDS)) {
                 server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
