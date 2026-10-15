@@ -19,16 +19,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.LongSupplier;
 
 public final class WorkerRegistry {
     private static final int MAX_PENDING_UPDATES = 256;
     // One lock keeps membership checks, changes and snapshots consistent.
-    private final Map<Integer, WorkerDescriptor> workers = new HashMap<>();
+    private final Map<Integer, Registration> workers = new HashMap<>();
     private final Set<MembershipWatch> watches = new HashSet<>();
     private final int maxNeighbours;
+    private final LongSupplier nanoTime;
     private final String epoch = UUID.randomUUID().toString();
     private long revision;
     private CoordinatorRecord coordinator;
@@ -39,32 +42,89 @@ public final class WorkerRegistry {
     }
 
     public WorkerRegistry(int maxNeighbours) {
+        this(maxNeighbours, System::nanoTime);
+    }
+
+    WorkerRegistry(int maxNeighbours, LongSupplier nanoTime) {
         this.maxNeighbours = Math.max(1, maxNeighbours);
+        this.nanoTime = Objects.requireNonNull(nanoTime);
+    }
+
+    private static final class Registration {
+        private final WorkerDescriptor worker;
+        private long leaseDurationNanos;
+        private long leaseDeadlineNanos;
+
+        private Registration(WorkerDescriptor worker) {
+            this.worker = worker;
+        }
     }
 
     // True for a new worker, false for an exact retry.
     public synchronized boolean registerWorker(WorkerDescriptor worker) {
         validateWorker(worker);
         int id = worker.getIdentity().getWorkerId();
-        WorkerDescriptor existing = workers.get(id);
+        Registration existing = workers.get(id);
         if (existing != null) {
-            if (!existing.equals(worker)) {
+            if (!existing.worker.equals(worker)) {
                 throw new IllegalStateException("Worker ID " + id + " is already registered");
+            }
+            if (existing.leaseDurationNanos != 0) {
+                long now = nanoTime.getAsLong();
+                requireLiveLease(existing, now);
+                existing.leaseDeadlineNanos = now + existing.leaseDurationNanos;
             }
             return false;
         }
-        workers.put(id, worker);
+        workers.put(id, new Registration(worker));
         membershipChanged(MembershipChange.Kind.JOINED, worker);
         return true;
     }
 
     public synchronized Optional<WorkerDescriptor> findWorker(int workerId) {
         validateWorkerId(workerId);
-        return Optional.ofNullable(workers.get(workerId));
+        return Optional.ofNullable(workers.get(workerId)).map(registration -> registration.worker);
     }
 
     public synchronized List<WorkerDescriptor> snapshot() {
-        return List.copyOf(workers.values());
+        return workers.values().stream().map(registration -> registration.worker).toList();
+    }
+
+    // First renewal opts this session into leases; registration alone remains permanent.
+    public synchronized void renewLease(WorkerIdentity identity, long durationMillis) {
+        validateIdentity(identity);
+        if (durationMillis <= 0 || durationMillis > Long.MAX_VALUE / 1_000_000) {
+            throw new IllegalArgumentException("Lease duration must be positive and fit in nanoseconds");
+        }
+        Registration registration = workers.get(identity.getWorkerId());
+        if (registration == null) {
+            throw new NoSuchElementException("Worker ID " + identity.getWorkerId() + " is not registered");
+        }
+        requireSession(identity, registration.worker);
+        long now = nanoTime.getAsLong();
+        requireLiveLease(registration, now);
+        registration.leaseDurationNanos = durationMillis * 1_000_000;
+        registration.leaseDeadlineNanos = now + registration.leaseDurationNanos;
+    }
+
+    public synchronized int expireLeases() {
+        long now = nanoTime.getAsLong();
+        List<WorkerIdentity> expired = workers.values().stream()
+                .filter(registration -> leaseExpired(registration, now))
+                .map(registration -> registration.worker.getIdentity()).toList();
+        expired.forEach(this::deregisterWorker);
+        return expired.size();
+    }
+
+    private static boolean leaseExpired(Registration registration, long now) {
+        // Subtraction keeps nanoTime deadlines valid across signed counter wraparound.
+        return registration.leaseDurationNanos != 0 && now - registration.leaseDeadlineNanos >= 0;
+    }
+
+    private static void requireLiveLease(Registration registration, long now) {
+        if (leaseExpired(registration, now)) {
+            throw new IllegalStateException("Worker lease has expired");
+        }
     }
 
     public String getEpoch() {
@@ -73,7 +133,7 @@ public final class WorkerRegistry {
 
     public synchronized MembershipSnapshot membershipSnapshot() {
         return MembershipSnapshot.newBuilder().setRegistryEpoch(epoch)
-                .setMembershipRevision(revision).addAllWorkers(workers.values()).build();
+                .setMembershipRevision(revision).addAllWorkers(snapshot()).build();
     }
 
     public synchronized MembershipWatch watchMembership() {
@@ -156,8 +216,8 @@ public final class WorkerRegistry {
         validateWorker(record.getCoordinator());
         validateTerm(record.getTerm());
         requireEpoch(registryEpoch);
-        WorkerDescriptor registered = workers.get(record.getCoordinator().getIdentity().getWorkerId());
-        if (!record.getCoordinator().equals(registered)) {
+        Registration registered = workers.get(record.getCoordinator().getIdentity().getWorkerId());
+        if (registered == null || !record.getCoordinator().equals(registered.worker)) {
             throw new IllegalStateException("Coordinator must match a registered worker session and endpoint");
         }
         if (record.equals(coordinator)) {
@@ -200,28 +260,29 @@ public final class WorkerRegistry {
 
     public synchronized boolean deregisterWorker(WorkerIdentity identity) {
         validateIdentity(identity);
-        WorkerDescriptor existing = workers.get(identity.getWorkerId());
+        Registration existing = workers.get(identity.getWorkerId());
         if (existing == null) {
             return false;
         }
-        requireSession(identity, existing);
+        requireSession(identity, existing.worker);
         workers.remove(identity.getWorkerId());
         if (coordinator != null && coordinator.getCoordinator().getIdentity().getWorkerId() == identity.getWorkerId()) {
             coordinator = null;
         }
-        membershipChanged(MembershipChange.Kind.LEFT, existing);
+        membershipChanged(MembershipChange.Kind.LEFT, existing.worker);
         return true;
     }
 
     public synchronized List<WorkerDescriptor> getInitialNeighbours(WorkerIdentity requester) {
         validateIdentity(requester);
-        WorkerDescriptor existing = workers.get(requester.getWorkerId());
+        Registration existing = workers.get(requester.getWorkerId());
         if (existing == null) {
             throw new NoSuchElementException("Worker ID " + requester.getWorkerId() + " is not registered");
         }
-        requireSession(requester, existing);
+        requireSession(requester, existing.worker);
         List<WorkerDescriptor> candidates = new ArrayList<>();
-        for (WorkerDescriptor worker : workers.values()) {
+        for (Registration registration : workers.values()) {
+            WorkerDescriptor worker = registration.worker;
             if (worker.getIdentity().getWorkerId() != requester.getWorkerId()) {
                 candidates.add(worker);
             }
