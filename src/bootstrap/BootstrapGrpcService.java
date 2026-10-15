@@ -13,24 +13,39 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
+import java.util.function.LongSupplier;
 
 public final class BootstrapGrpcService extends BootstrapServiceGrpc.BootstrapServiceImplBase implements AutoCloseable {
+    static final long DEFAULT_LEASE_DURATION_MS = 30_000;
     private final WorkerRegistry registry;
+    private final long leaseDurationMillis;
+    private final LongSupplier wallTimeMillis;
     // One reader per stream, with no queue of waiting streaming tasks.
     private final ThreadPoolExecutor streams = new ThreadPoolExecutor(0, 16, 30, TimeUnit.SECONDS,
             new SynchronousQueue<>(), task -> new Thread(task, "bootstrap-membership"));
 
     public BootstrapGrpcService(WorkerRegistry registry) {
+        this(registry, DEFAULT_LEASE_DURATION_MS, System::currentTimeMillis);
+    }
+
+    BootstrapGrpcService(WorkerRegistry registry, long leaseDurationMillis, LongSupplier wallTimeMillis) {
+        if (leaseDurationMillis <= 0 || leaseDurationMillis > Long.MAX_VALUE / 1_000_000) {
+            throw new IllegalArgumentException("Lease duration must be positive and fit in nanoseconds");
+        }
         this.registry = Objects.requireNonNull(registry);
+        this.leaseDurationMillis = leaseDurationMillis;
+        this.wallTimeMillis = Objects.requireNonNull(wallTimeMillis);
     }
 
     @Override
     public void registerWorker(RegisterWorkerRequest request, StreamObserver<RegisterWorkerResponse> observer) {
         respond(observer, Status.ALREADY_EXISTS, () -> {
+            long duration = registry.leaseDurationMillis(request.getWorker().getIdentity().getWorkerId());
+            long expiresAt = leaseExpiresAt(duration);
             boolean created = registry.registerWorker(request.getWorker());
             MembershipSnapshot state = registry.membershipSnapshot();
-            // Lease fields stay unset until lease support is implemented.
             return RegisterWorkerResponse.newBuilder().setWorker(request.getWorker()).setCreated(created)
+                    .setLeaseDurationMs(duration).setLeaseExpiresAtMs(expiresAt)
                     .setRegistryEpoch(state.getRegistryEpoch()).setMembershipRevision(state.getMembershipRevision()).build();
         });
     }
@@ -68,6 +83,34 @@ public final class BootstrapGrpcService extends BootstrapServiceGrpc.BootstrapSe
     public void listWorkers(ListWorkersRequest request, StreamObserver<ListWorkersResponse> observer) {
         respond(observer, Status.FAILED_PRECONDITION,
                 () -> ListWorkersResponse.newBuilder().setSnapshot(registry.membershipSnapshot()).build());
+    }
+
+    @Override
+    public void renewLease(RenewLeaseRequest request, StreamObserver<RenewLeaseResponse> observer) {
+        respond(observer, Status.FAILED_PRECONDITION, () -> {
+            if (!request.hasWorker()) {
+                throw new IllegalArgumentException("Worker identity is required");
+            }
+            requireEpoch(request.getRegistryEpoch());
+            long expiresAt = leaseExpiresAt(leaseDurationMillis);
+            registry.renewLease(request.getWorker(), leaseDurationMillis);
+            return RenewLeaseResponse.newBuilder().setWorker(request.getWorker())
+                    .setLeaseDurationMs(leaseDurationMillis).setLeaseExpiresAtMs(expiresAt)
+                    .setRegistryEpoch(registry.getEpoch())
+                    .setMembershipRevision(registry.membershipSnapshot().getMembershipRevision()).build();
+        });
+    }
+
+    private long leaseExpiresAt(long duration) {
+        if (duration == 0) {
+            return 0;
+        }
+        long now = wallTimeMillis.getAsLong();
+        if (now < 0 || now > Long.MAX_VALUE - duration) {
+            throw Status.INTERNAL.withDescription("Cannot represent lease expiry timestamp").asRuntimeException();
+        }
+        // Unix time is advisory; registry deadlines still use monotonic time.
+        return now + duration;
     }
 
     @Override

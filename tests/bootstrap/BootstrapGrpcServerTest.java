@@ -124,8 +124,8 @@ public class BootstrapGrpcServerTest {
     }
 
     @Test
-    public void deferredMethodsRemainUnimplemented() {
-        assertStatus(Status.Code.UNIMPLEMENTED, () -> stub.renewLease(RenewLeaseRequest.getDefaultInstance()));
+    public void leaseRenewalRequiresWorkerIdentity() {
+        assertStatus(Status.Code.INVALID_ARGUMENT, () -> stub.renewLease(RenewLeaseRequest.getDefaultInstance()));
     }
 
     @Test

@@ -116,6 +116,11 @@ public final class WorkerRegistry {
         return expired.size();
     }
 
+    synchronized long leaseDurationMillis(int workerId) {
+        Registration registration = workers.get(workerId);
+        return registration == null ? 0 : registration.leaseDurationNanos / 1_000_000;
+    }
+
     private static boolean leaseExpired(Registration registration, long now) {
         // Subtraction keeps nanoTime deadlines valid across signed counter wraparound.
         return registration.leaseDurationNanos != 0 && now - registration.leaseDeadlineNanos >= 0;
