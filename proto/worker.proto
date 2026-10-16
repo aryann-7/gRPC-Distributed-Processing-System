@@ -100,3 +100,53 @@ service WorkerService {
     // 4. Coordinator cancels a running task (fault tolerance & preemption hook)
     rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
 }
+
+
+message ElectionRequest {
+    int32 candidate_id = 1;
+    int32 candidate_jac = 2;
+    int32 term = 3;
+    string message_id = 4;
+}
+
+message ElectionResponse {
+    bool accepted = 1;
+    int32 best_candidate_id = 2;
+    int32 best_candidate_jac = 3;
+    int32 term = 4;
+    string message = 5;
+}
+
+message CoordinatorAnnouncement {
+    int32 coordinator_id = 1;
+    int32 coordinator_jac = 2;
+    int32 term = 3;
+}
+
+message CoordinatorStateRequest {
+    int32 requesting_coordinator_id = 1;
+    int32 term = 2;
+}
+
+message TaskCheckpoint {
+    string job_id = 1;
+    string task_id = 2;
+    string status = 3;
+    int32 assigned_worker_id = 4;
+    bool has_result = 5;
+    int64 result_value = 6;
+}
+
+message CoordinatorStateResponse {
+    int32 coordinator_id = 1;
+    int32 term = 2;
+    repeated TaskCheckpoint tasks = 3;
+}
+
+service CoordinatorElectionService {
+    rpc StartElection(ElectionRequest) returns (ElectionResponse);
+    rpc AnnounceCoordinator(CoordinatorAnnouncement)
+        returns (ElectionResponse);
+    rpc GetCoordinatorState(CoordinatorStateRequest)
+        returns (CoordinatorStateResponse);
+}
