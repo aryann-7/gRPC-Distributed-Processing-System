@@ -34,8 +34,10 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
      */
     @Override
     public void executeTaskStream(TaskDispatchRequest request, StreamObserver<TaskProgressUpdate> responseObserver) {
+        java.util.concurrent.atomic.AtomicReference<TaskProgressUpdate> latest = new java.util.concurrent.atomic.AtomicReference<>();
         // Callback listener that forwards each incremental progress update through gRPC stream
         ProgressListener progressListener = update -> {
+            latest.set(update);
             synchronized (responseObserver) {
                 try {
                     responseObserver.onNext(update);
@@ -55,11 +57,16 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
                 TaskResultResponse result = future.get();
                 synchronized (responseObserver) {
                     // Send final 100% or completion status
+                    TaskProgressUpdate previous = latest.get();
                     TaskProgressUpdate finalUpdate = TaskProgressUpdate.newBuilder()
                             .setJobId(request.getJobId())
                             .setTaskId(request.getTaskId())
                             .setWorkerId(workerId)
-                            .setProgressPercentage(100.0)
+                            .setProgressPercentage(result.getSuccess() ? 100.0 : previous == null ? 0 : previous.getProgressPercentage())
+                            .setUnitsCompleted(previous == null ? 0 : previous.getUnitsCompleted())
+                            .setTotalUnits(previous == null ? 0 : previous.getTotalUnits())
+                            .setAttempt(request.getAttempt()).setCoordinatorTerm(request.getCoordinatorTerm())
+                            .setFinalResult(result.toBuilder().setAttempt(request.getAttempt()).setCoordinatorTerm(request.getCoordinatorTerm()))
                             .setStatusMessage(result.getSuccess() ? "COMPLETED" : "FAILED: " + result.getErrorMessage())
                             .setTimestampMs(System.currentTimeMillis())
                             .build();

@@ -38,6 +38,10 @@ public final class PeerGrpcClient implements AutoCloseable {
                 .addNeighbour(AddNeighbourRequest.newBuilder().setNeighbour(neighbour).build());
     }
 
+    ManagedChannel channel() {
+        return channel;
+    }
+
     @Override
     public void close() {
         channel.shutdown();
