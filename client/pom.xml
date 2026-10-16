@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   DistriLab client: a separate project, as the A2 spec requires.
-  It shares only the team's .proto contract in ../proto (common, worker,
-  bootstrap, coordinator) with the bootstrap and worker projects; it does
-  not depend on any of their Java code.
+  It does not depend on any of the bootstrap or worker projects' Java code.
+  It only shares the team's .proto contract. client/proto/ holds the client's
+  own copy of the four files it needs (common, worker, bootstrap, coordinator),
+  copied unchanged from Member 1's proto files. If those change, update this
+  copy to match, so the client and the servers use the same contract.
 
   Build and test:   mvn test
   Run the client:   mvn -q compile exec:java -Dexec.args="1 localhost 50050"
@@ -101,7 +103,7 @@
                     <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
                     <pluginId>grpc-java</pluginId>
                     <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
-                    <protoSourceRoot>${project.basedir}/../proto</protoSourceRoot>
+                    <protoSourceRoot>${project.basedir}/proto</protoSourceRoot>
                     <includes>
                         <include>common.proto</include>
                         <include>worker.proto</include>
