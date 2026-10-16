@@ -8,6 +8,7 @@ import common.models.JobResult;
 import common.models.JobTask;
 import java.rmi.Naming;
 import java.rmi.RemoteException;
+import java.rmi.NoSuchObjectException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
@@ -18,6 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import worker.computation.JobRunner;
 import worker.computation.TaskExecutionEngine;
 import worker.coordinator.CoordinatorManager;
@@ -44,11 +46,16 @@ public class WorkerNode extends UnicastRemoteObject
         private final Map<String, ElectionCandidate> bestCandidates = new ConcurrentHashMap<>();
         private final WorkerGrpcServer grpcServer;
         private final TaskExecutionEngine executionEngine;
+        private final AtomicBoolean stopped = new AtomicBoolean();
 
         public WorkerNode(
                         int workerId,
                         String host,
                         int port) throws RemoteException {
+                this(workerId, host, port, 0);
+        }
+
+        public WorkerNode(int workerId, String host, int port, int grpcPort) throws RemoteException {
 
                 super();
 
@@ -56,14 +63,28 @@ public class WorkerNode extends UnicastRemoteObject
                 this.host = host;
                 this.port = port;
 
-                // Initialize and start the embedded gRPC server on the worker port
-                this.grpcServer = new WorkerGrpcServer(workerId, port, 4);
-                this.executionEngine = this.grpcServer.getExecutionEngine();
+                WorkerGrpcServer startingServer = null;
                 try {
-                        this.grpcServer.start();
+                        if (port < 1 || port > 65535 || grpcPort < 0 || grpcPort > 65535 || grpcPort == port) {
+                                throw new IllegalArgumentException("RMI and gRPC require distinct valid ports; gRPC may use 0");
+                        }
+                        startingServer = new WorkerGrpcServer(workerId, grpcPort, 4);
+                        startingServer.start();
                 } catch (Exception e) {
-                        System.err.println("Worker " + workerId + " failed to start gRPC server on port " + port + ": " + e.getMessage());
+                        computationThreadPool.shutdownNow();
+                        if (startingServer != null) {
+                                try {
+                                        startingServer.stop();
+                                } catch (InterruptedException interrupted) {
+                                        Thread.currentThread().interrupt();
+                                        e.addSuppressed(interrupted);
+                                }
+                        }
+                        UnicastRemoteObject.unexportObject(this, true);
+                        throw new RemoteException("Worker " + workerId + " gRPC startup failed on port " + grpcPort, e);
                 }
+                this.grpcServer = startingServer;
+                this.executionEngine = startingServer.getExecutionEngine();
         }
 
         /**
@@ -827,11 +848,24 @@ public class WorkerNode extends UnicastRemoteObject
         }
 
         public void stop() {
-                if (grpcServer != null) {
+                if (!stopped.compareAndSet(false, true)) {
+                        return;
+                }
+                try {
+                        grpcServer.stop();
+                } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                } finally {
+                        computationThreadPool.shutdownNow();
                         try {
-                                grpcServer.stop();
-                        } catch (Exception e) {
-                                e.printStackTrace();
+                                if (coordinatorManager != null) {
+                                        UnicastRemoteObject.unexportObject(coordinatorManager, true);
+                                }
+                        } catch (NoSuchObjectException ignored) {
+                        }
+                        try {
+                                UnicastRemoteObject.unexportObject(this, true);
+                        } catch (NoSuchObjectException ignored) {
                         }
                 }
         }

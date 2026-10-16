@@ -2,13 +2,15 @@ package worker;
 
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
+import java.rmi.NoSuchObjectException;
+import java.rmi.server.UnicastRemoteObject;
 
 /**
  * Starts a standalone Worker process.
  *
  * Arguments:
  *
- * workerId host workerPort bootstrapHost bootstrapPort
+ * workerId host rmiPort bootstrapHost bootstrapPort [grpcPort]
  *
  * Example:
  *
@@ -18,18 +20,22 @@ public class WorkerMain {
 
         public static void main(String[] args) {
 
-                if (args.length < 5) {
+                if (args.length < 5 || args.length > 6) {
 
                         System.out.println(
                                         "Usage:");
                         System.out.println(
                                         "WorkerMain <workerId> <host> "
                                                         + "<workerPort> <bootstrapHost> "
-                                                        + "<bootstrapPort>");
+                                                        + "<bootstrapPort> [grpcPort; default 0 = assigned by OS]");
 
                         return;
                 }
 
+                Registry registry = null;
+                WorkerNode worker = null;
+                Thread shutdownHook = null;
+                boolean interrupted = false;
                 try {
 
                         int workerId = Integer.parseInt(args[0]);
@@ -41,20 +47,26 @@ public class WorkerMain {
                         String bootstrapHost = args[3];
 
                         int bootstrapPort = Integer.parseInt(args[4]);
+                        int grpcPort = args.length == 6 ? Integer.parseInt(args[5]) : 0;
 
                         /*
                          * Create an RMI registry for this worker.
                          */
-                        Registry registry = LocateRegistry.createRegistry(
+                        registry = LocateRegistry.createRegistry(
                                         workerPort);
 
                         /*
                          * Create worker.
                          */
-                        WorkerNode worker = new WorkerNode(
+                        worker = new WorkerNode(
                                         workerId,
                                         host,
-                                        workerPort);
+                                        workerPort, grpcPort);
+
+                        WorkerNode runningWorker = worker;
+                        Registry runningRegistry = registry;
+                        shutdownHook = new Thread(() -> shutdown(runningWorker, runningRegistry), "worker-shutdown");
+                        Runtime.getRuntime().addShutdownHook(shutdownHook);
 
                         /*
                          * Bind worker to its registry.
@@ -71,7 +83,7 @@ public class WorkerMain {
                                                         " started.");
 
                         System.out.println(
-                                        "gRPC / Service Port: " + workerPort);
+                                        "RMI Port: " + workerPort + "; gRPC Port: " + worker.getGrpcServer().getPort());
 
                         System.out.println(
                                         "JAC: " + worker.getJac());
@@ -103,9 +115,37 @@ public class WorkerMain {
                                 worker.wait();
                         }
 
+                } catch (InterruptedException e) {
+                        interrupted = true;
                 } catch (Exception e) {
+                        throw new IllegalStateException("Worker startup failed", e);
+                } finally {
+                        if (shutdownHook != null) {
+                                try {
+                                        Runtime.getRuntime().removeShutdownHook(shutdownHook);
+                                } catch (IllegalStateException ignored) {
+                                        // The JVM is already running shutdown hooks.
+                                }
+                        }
+                        shutdown(worker, registry);
+                        if (interrupted) {
+                                Thread.currentThread().interrupt();
+                        }
+                }
+        }
 
-                        e.printStackTrace();
+        private static void shutdown(WorkerNode worker, Registry registry) {
+                try {
+                        if (worker != null) {
+                                worker.stop();
+                        }
+                } finally {
+                        if (registry != null) {
+                                try {
+                                        UnicastRemoteObject.unexportObject(registry, true);
+                                } catch (NoSuchObjectException ignored) {
+                                }
+                        }
                 }
         }
 }
