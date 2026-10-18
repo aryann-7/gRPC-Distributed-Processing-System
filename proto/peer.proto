@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package distrilab;
+
+import "common.proto";
+
+option java_multiple_files = true;
+option java_package = "common.grpc";
+option java_outer_classname = "PeerServiceProto";
+
+service PeerService {
+    // Store the supplied peer without calling back or contacting Bootstrap.
+    // The joining worker registers itself remotely before storing that peer locally.
+    rpc AddNeighbour(AddNeighbourRequest) returns (AddNeighbourResponse);
+}
+
+message AddNeighbourRequest {
+    // Required valid descriptor; self-registration returns INVALID_ARGUMENT.
+    WorkerDescriptor neighbour = 1;
+}
+
+message AddNeighbourResponse {
+    // Descriptor actually stored. Repeated logical IDs preserve the existing entry,
+    // matching A1; callers check it matches their session/endpoint before linking.
+    WorkerDescriptor neighbour = 1;
+}

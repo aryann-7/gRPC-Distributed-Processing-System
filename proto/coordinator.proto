@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package distrilab;
+
+import "common.proto";
+import "worker.proto";
+
+option java_multiple_files = true;
+option java_package = "common.grpc";
+option java_outer_classname = "CoordinatorServiceProto";
+
+// Proposed asynchronous submission; coordinator and GUI owners implement it later.
+service CoordinatorService {
+    // Accept promptly; completion is reported through status/stream, not this RPC.
+    rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+    rpc GetJobStatus(GetJobStatusRequest) returns (JobProgress);
+    // First update is the latest full snapshot, including an already terminal job.
+    // Later updates replace it; emit terminal state then close normally. Reconnect
+    // with the same ID for a fresh snapshot. Disconnect does not cancel the job.
+    rpc WatchJob(WatchJobRequest) returns (stream JobProgress);
+    rpc GetCoordinatorStatus(GetCoordinatorStatusRequest) returns (GetCoordinatorStatusResponse);
+}
+
+message JobNumbers {
+    repeated int64 numbers = 1;
+}
+
+message JobRange {
+    // Inclusive bounds; normalize reversed bounds as the A1 coordinator does.
+    int64 start = 1;
+    int64 end = 2;
+}
+
+message SubmitJobRequest {
+    // Non-empty client-generated ID, reused for retries (prefer a full UUID).
+    string job_id = 1;
+    JobTypeProto job_type = 2;
+    // MAX/PRIMECOUNT require a non-empty list; PRIMESUM requires a range.
+    // Reject missing/mismatched input, unknown types or an unrepresentable unit count
+    // with INVALID_ARGUMENT. Exact retries return the existing ID without new work;
+    // a known ID with different type/normalized input returns ALREADY_EXISTS.
+    oneof input {
+        JobNumbers numbers = 3;
+        JobRange range = 4;
+    }
+}
+
+message SubmitJobResponse {
+    // Acceptance is not completion. An inactive coordinator returns FAILED_PRECONDITION.
+    string job_id = 1;
+}
+
+message GetJobStatusRequest {
+    // Empty ID => INVALID_ARGUMENT; unknown/not retained ID => NOT_FOUND.
+    string job_id = 1;
+}
+
+message WatchJobRequest {
+    // Same lookup rules as GetJobStatus, including after coordinator changes.
+    // Reconnect through Bootstrap discovery; state retention/transfer is owner-defined.
+    // NOT_FOUND does not prove the job never ran; do not automatically resubmit it.
+    string job_id = 1;
+}
+
+enum JobStateProto {
+    JOB_STATE_UNSPECIFIED = 0;
+    QUEUED = 1;
+    RUNNING = 2;
+    COMPLETED = 3;
+    FAILED = 4;
+}
+
+message WorkerJobProgress {
+    WorkerIdentity worker = 1;
+    // Aggregate latest task counters for this worker/session, not sums of events.
+    int64 units_completed = 2;
+    int64 total_units = 3;
+}
+
+message JobProgress {
+    string job_id = 1;
+    JobStateProto state = 2;
+    // Items examined for MAX/PRIMECOUNT; integers evaluated for PRIMESUM.
+    // Total is fixed by accepted input, including queued/unallocated work.
+    // 0 <= completed <= total; count each logical unit once, never elapsed time.
+    // Percentage = 100 * completed / total (floating point); do not average workers.
+    int64 units_completed = 3;
+    int64 total_units = 4;
+    // Full worker breakdown, including completed allocations. Empty before allocation.
+    repeated WorkerJobProgress workers = 5;
+    // Only COMPLETED sets result_value; only FAILED sets a non-empty error_message.
+    // Other states have no outcome. Full work count alone does not imply success.
+    oneof outcome {
+        int64 result_value = 6;
+        string error_message = 7;
+    }
+    // Elapsed job execution duration, separate from the completion metric.
+    int64 execution_time_ms = 8;
+}
+
+message GetCoordinatorStatusRequest {}
+
+message GetCoordinatorStatusResponse {
+    // Status of the contacted coordinator, not Bootstrap directory discovery.
+    WorkerIdentity coordinator = 1;
+    int32 term = 2;
+    int32 job_allocation_counter = 3;
+    int32 jobs_in_term = 4;
+    int32 max_jobs_per_term = 5;
+}

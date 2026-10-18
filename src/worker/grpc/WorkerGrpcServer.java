@@ -13,14 +13,12 @@ import java.util.concurrent.TimeUnit;
 public class WorkerGrpcServer {
 
     private final int workerId;
-    private final int port;
     private final Server server;
     private final WorkerServiceImpl workerService;
     private final TaskExecutionEngine executionEngine;
 
     public WorkerGrpcServer(int workerId, int port, int threadPoolSize) {
         this.workerId = workerId;
-        this.port = port;
         this.executionEngine = new TaskExecutionEngine(workerId, threadPoolSize);
         this.workerService = new WorkerServiceImpl(workerId, executionEngine);
 
@@ -31,23 +29,23 @@ public class WorkerGrpcServer {
 
     public void start() throws IOException {
         server.start();
-        System.out.println("Worker " + workerId + " gRPC Server started on port " + port);
+        System.out.println("Worker " + workerId + " gRPC Server started on port " + getPort());
+    }
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.err.println("Shutting down Worker " + workerId + " gRPC Server...");
-            try {
-                WorkerGrpcServer.this.stop();
-            } catch (InterruptedException e) {
-                e.printStackTrace(System.err);
-            }
-        }));
+    public int getPort() {
+        return server.getPort();
     }
 
     public void stop() throws InterruptedException {
-        if (server != null) {
-            server.shutdown().awaitTermination(5, TimeUnit.SECONDS);
-        }
-        if (executionEngine != null) {
+        server.shutdown();
+        try {
+            if (!server.awaitTermination(5, TimeUnit.SECONDS)) {
+                server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException e) {
+            server.shutdownNow();
+            throw e;
+        } finally {
             executionEngine.shutdown();
         }
     }

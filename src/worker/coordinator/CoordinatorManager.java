@@ -8,7 +8,7 @@ import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class CoordinatorManager extends UnicastRemoteObject implements CoordinatorService {
+public class CoordinatorManager extends UnicastRemoteObject implements CoordinatorService, AutoCloseable {
 
     private static final long serialVersionUID = 1L;
 
@@ -60,6 +60,11 @@ public class CoordinatorManager extends UnicastRemoteObject implements Coordinat
 
     @Override
     public JobResult submitJob(JobRequest request) throws RemoteException {
+        return submitJob(request, (worker, update) -> {});
+    }
+
+    public JobResult submitJob(JobRequest request,
+            java.util.function.BiConsumer<common.grpc.WorkerIdentity, common.grpc.TaskProgressUpdate> progress) throws RemoteException {
         long startTime = System.currentTimeMillis();
         JobResult finalResult = new JobResult();
 
@@ -121,6 +126,9 @@ public class CoordinatorManager extends UnicastRemoteObject implements Coordinat
 
             futures.add(dispatchPool.submit(() -> {
                 try {
+                    if (worker instanceof worker.grpc.WorkerGrpcClient client) {
+                        return client.executeJob(task, update -> progress.accept(client.descriptor().getIdentity(), update));
+                    }
                     return worker.executeJob(task);
                 } catch (Exception e) {
                     JobResult err = new JobResult();
@@ -288,5 +296,12 @@ public class CoordinatorManager extends UnicastRemoteObject implements Coordinat
 
     public int getPersistentJac() {
         return persistentJac.get();
+    }
+
+    @Override
+    public void close() {
+        dispatchPool.shutdownNow();
+        try { UnicastRemoteObject.unexportObject(this, true); }
+        catch (java.rmi.NoSuchObjectException ignored) { }
     }
 }

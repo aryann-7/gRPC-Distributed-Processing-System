@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package distrilab;
+
+option java_multiple_files = true;
+option java_package = "common.grpc";
+option java_outer_classname = "CommonProto";
+
+// Shared network types. Protobuf does not enforce these validation rules;
+// receiving services must validate required message presence and scalar values.
+// Existing worker.proto computation messages and field numbers remain unchanged.
+
+message WorkerIdentity {
+    // Logical ID: 1..2147483647, consistent with A1 and worker.proto int32 IDs.
+    int32 worker_id = 1;
+
+    // Non-empty opaque process incarnation ID, preferably a random UUID.
+    // Generate once per process startup, reuse for retries, and generate a new
+    // value after restart even when worker_id is unchanged. Not an auth token.
+    string session_id = 2;
+}
+
+message WorkerEndpoint {
+    // Reachable advertised hostname or IPv4/IPv6 address, without scheme or port.
+    // Must be non-empty and contain no whitespace. IPv6 is stored without brackets.
+    // Do not advertise a wildcard bind address such as 0.0.0.0 or ::.
+    string host = 1;
+
+    // Advertised gRPC listening port, 1..65535; protobuf permits invalid values.
+    int32 port = 2;
+}
+
+message WorkerDescriptor {
+    // Both identity and endpoint must be present and valid.
+    WorkerIdentity identity = 1;
+    WorkerEndpoint endpoint = 2;
+}

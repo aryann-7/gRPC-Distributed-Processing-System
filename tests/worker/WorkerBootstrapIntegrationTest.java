@@ -15,7 +15,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 
 /** Plain-Java integration checks using real local RMI calls; no worker processes. */
 public class WorkerBootstrapIntegrationTest implements AutoCloseable {
@@ -134,12 +133,6 @@ public class WorkerBootstrapIntegrationTest implements AutoCloseable {
         Field field = WorkerNode.class.getDeclaredField("neighbours");
         field.setAccessible(true);
         return new HashMap<>((Map<Integer, WorkerService>) field.get(node));
-    }
-
-    private static void stopExecutor(WorkerNode node) throws Exception {
-        Field field = WorkerNode.class.getDeclaredField("computationThreadPool");
-        field.setAccessible(true);
-        ((ExecutorService) field.get(node)).shutdownNow();
     }
 
     private static void expectRejected(RemoteCall call, String description) throws Exception {
@@ -261,11 +254,9 @@ public class WorkerBootstrapIntegrationTest implements AutoCloseable {
         for (int i = exported.size() - 1; i >= 0; i--) {
             Remote object = exported.get(i);
             try {
-                try {
-                    if (object instanceof WorkerNode) {
-                        stopExecutor((WorkerNode) object);
-                    }
-                } finally {
+                if (object instanceof WorkerNode) {
+                    ((WorkerNode) object).stop();
+                } else {
                     UnicastRemoteObject.unexportObject(object, true);
                 }
             } catch (Exception e) {

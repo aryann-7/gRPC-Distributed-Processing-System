@@ -1,0 +1,202 @@
+syntax = "proto3";
+
+package distrilab;
+
+import "common.proto";
+
+option java_multiple_files = true;
+option java_package = "common.grpc";
+option java_outer_classname = "BootstrapServiceProto";
+
+// TASK 1 DRAFT: lease/retry policy, stream reconnection, and coordinator directory
+// semantics require worker, coordinator, and election owner agreement before use.
+// Bootstrap tracks membership and discovers endpoints. It never elects a leader,
+// partitions jobs, allocates tasks, or decides task failure/reassignment.
+// A live lease denotes registered membership, not proof a worker can execute jobs.
+//
+// Shared response/error policy:
+// - OK means the operation described by the response completed, not that any
+//   election, peer connection, or scheduling operation completed.
+// - INVALID_ARGUMENT: absent required messages, invalid IDs/endpoints/terms.
+// - NOT_FOUND: discovery/renewal for a worker without a live registration.
+// - ALREADY_EXISTS: registration conflicts with a live logical worker ID.
+// - FAILED_PRECONDITION: stale registry epoch, mismatched session, or stale or
+//   conflicting coordinator publication/clear. Such errors never replace state.
+// - UNAVAILABLE / DEADLINE_EXCEEDED: transport uncertainty; a mutation may have
+//   completed. Retry with the same identity and payload; reconcile when necessary.
+// Clients must set deadlines for unary calls and close channels on shutdown.
+// These identity/session fields provide fencing, not caller authentication.
+service BootstrapService {
+    rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+    rpc GetInitialNeighbours(GetInitialNeighboursRequest) returns (GetInitialNeighboursResponse);
+    rpc DeregisterWorker(DeregisterWorkerRequest) returns (DeregisterWorkerResponse);
+    rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+    rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+    rpc WatchMembership(WatchMembershipRequest) returns (stream MembershipUpdate);
+
+    // Proposed discovery architecture: store an externally elected coordinator.
+    // Publication is not evidence that Bootstrap validated an election outcome.
+    rpc GetCoordinator(GetCoordinatorRequest) returns (GetCoordinatorResponse);
+    rpc PublishCoordinator(PublishCoordinatorRequest) returns (PublishCoordinatorResponse);
+    rpc ClearCoordinator(ClearCoordinatorRequest) returns (ClearCoordinatorResponse);
+}
+
+message RegisterWorkerRequest {
+    // Required. A live identity's endpoint is immutable for that session.
+    WorkerDescriptor worker = 1;
+}
+
+message RegisterWorkerResponse {
+    WorkerDescriptor worker = 1;
+    // True for a new membership; false for an exact identity+endpoint retry.
+    // Exact retries succeed and renew the lease without advancing the revision.
+    // A different session/endpoint for a live ID returns ALREADY_EXISTS. A new
+    // process may register that ID only after removal or expiry; no forced takeover.
+    bool created = 2;
+    int64 lease_duration_ms = 3;
+    // Server Unix time in milliseconds; advisory to clients with different clocks.
+    // Expiry decisions use the server's clock. Renew using lease_duration_ms.
+    int64 lease_expires_at_ms = 4;
+    // Opaque non-empty ID, regenerated whenever membership state is reset (e.g.
+    // an in-memory Bootstrap restart). Revisions are comparable only within it.
+    string registry_epoch = 5;
+    int64 membership_revision = 6;
+}
+
+message GetInitialNeighboursRequest {
+    // Requester must have a live matching registration in this registry epoch.
+    WorkerIdentity requester = 1;
+    string registry_epoch = 2;
+}
+
+message GetInitialNeighboursResponse {
+    // Random distinct live descriptors, excluding requester.worker_id. Count is
+    // min(server-configured positive neighbour limit, eligible peer count).
+    // Empty is successful for the first/only worker. This does not create links.
+    repeated WorkerDescriptor neighbours = 1;
+    string registry_epoch = 2;
+    int64 membership_revision = 3;
+}
+
+message DeregisterWorkerRequest {
+    WorkerIdentity worker = 1;
+    string registry_epoch = 2;
+}
+
+message DeregisterWorkerResponse {
+    // Matching live entry removed => true. Already absent => successful false.
+    // If the logical ID now belongs to another session, reject without removing it.
+    bool removed = 1;
+    string registry_epoch = 2;
+    int64 membership_revision = 3;
+}
+
+message ListWorkersRequest {}
+
+message ListWorkersResponse {
+    MembershipSnapshot snapshot = 1;
+}
+
+message RenewLeaseRequest {
+    WorkerIdentity worker = 1;
+    string registry_epoch = 2;
+}
+
+message RenewLeaseResponse {
+    WorkerIdentity worker = 1;
+    int64 lease_duration_ms = 2;
+    int64 lease_expires_at_ms = 3;
+    string registry_epoch = 4;
+    // Renewal does not change topology, revision, or emit a membership event.
+    int64 membership_revision = 5;
+}
+
+message WatchMembershipRequest {}
+
+message MembershipSnapshot {
+    string registry_epoch = 1;
+    // Non-negative monotonic int64. Starts at zero for an empty registry epoch;
+    // increments once per join/removal/expiry. No increment for no-ops or renewal.
+    int64 membership_revision = 2;
+    // Complete live membership at this revision; ordering is not significant.
+    repeated WorkerDescriptor workers = 3;
+}
+
+message MembershipChange {
+    enum Kind {
+        KIND_UNSPECIFIED = 0;
+        JOINED = 1;
+        LEFT = 2;
+        EXPIRED = 3;
+    }
+    // Never KIND_UNSPECIFIED in an emitted event.
+    Kind kind = 1;
+    // Joined descriptor or the exact descriptor removed/expired, including session.
+    WorkerDescriptor worker = 2;
+    string registry_epoch = 3;
+    int64 membership_revision = 4;
+}
+
+message MembershipUpdate {
+    // First message is always a complete snapshot (including an empty snapshot).
+    // Subsequent changes follow that snapshot with contiguous increasing revisions
+    // in the same epoch. Snapshot capture/subscription must not lose concurrent joins.
+    // No replay log is required: after disconnect/gap/epoch change, subscribe again
+    // and replace local membership from a fresh snapshot. Slow subscribers may be
+    // terminated with RESOURCE_EXHAUSTED rather than silently dropping events.
+    // Stream cancellation releases subscriber resources; it never deregisters workers.
+    oneof payload {
+        MembershipSnapshot snapshot = 1;
+        MembershipChange change = 2;
+    }
+}
+
+message CoordinatorRecord {
+    // Required: descriptor of a currently registered worker process. Proposed:
+    // coordinator RPCs share its worker gRPC endpoint; confirm with server owner.
+    WorkerDescriptor coordinator = 1;
+    // Positive election term, matching existing worker.proto int32 current_term.
+    int32 term = 2;
+}
+
+message GetCoordinatorRequest {}
+
+message GetCoordinatorResponse {
+    // Absent means no coordinator is currently published; this is a successful
+    // discovery result, not an instruction to Bootstrap to initiate an election.
+    CoordinatorRecord coordinator = 1;
+    string registry_epoch = 2;
+}
+
+message PublishCoordinatorRequest {
+    // Identity/endpoint must exactly match a live registration. An identical record
+    // retry is idempotent. Only a strictly greater term may replace another record;
+    // a different coordinator in the same term is rejected, never arbitrated here.
+    CoordinatorRecord coordinator = 1;
+    string registry_epoch = 2;
+}
+
+message PublishCoordinatorResponse {
+    CoordinatorRecord coordinator = 1;
+    // True if the directory changed; false for an identical publication retry.
+    bool updated = 2;
+    string registry_epoch = 3;
+}
+
+message ClearCoordinatorRequest {
+    // Compare-and-clear: both identity/session and term must match the record.
+    WorkerIdentity coordinator = 1;
+    int32 term = 2;
+    string registry_epoch = 3;
+}
+
+message ClearCoordinatorResponse {
+    // True if matching record cleared; false if already absent. Reject a mismatch
+    // when another record exists. Removal/expiry of the published worker also clears
+    // its directory entry. These directory changes do not increment membership
+    // revision or emit membership events on their own.
+    // Keep the highest published term for the epoch even after clear/expiry;
+    // publication at or below that term cannot resurrect a cleared record.
+    bool cleared = 1;
+    string registry_epoch = 2;
+}

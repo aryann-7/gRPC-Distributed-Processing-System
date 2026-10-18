@@ -258,7 +258,11 @@ public class ClientJobEndToEndTest implements AutoCloseable {
     public void close() {
         for (int i = exported.size() - 1; i >= 0; i--) {
             try {
-                UnicastRemoteObject.unexportObject(exported.get(i), true);
+                if (exported.get(i) instanceof WorkerNode) {
+                    ((WorkerNode) exported.get(i)).stop();
+                } else {
+                    UnicastRemoteObject.unexportObject(exported.get(i), true);
+                }
             } catch (Exception ignored) {
                 // best-effort cleanup; a failure here shouldn't mask a
                 // real test failure that already happened above
