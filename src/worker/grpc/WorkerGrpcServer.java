@@ -3,6 +3,7 @@ package worker.grpc;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import worker.computation.TaskExecutionEngine;
+import worker.coordinator.CoordinatorServiceImpl;
 
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
@@ -15,15 +16,32 @@ public class WorkerGrpcServer {
     private final int workerId;
     private final Server server;
     private final WorkerServiceImpl workerService;
+    private final CoordinatorServiceImpl coordinatorService;
     private final TaskExecutionEngine executionEngine;
 
     public WorkerGrpcServer(int workerId, int port, int threadPoolSize) {
+        this(workerId, port, threadPoolSize, null, null, null);
+    }
+
+    public WorkerGrpcServer(int workerId, int port, int threadPoolSize,
+                            java.util.function.Supplier<worker.coordinator.CoordinatorManager> coordinatorManagerSupplier,
+                            java.util.function.Supplier<Boolean> isCoordinatorSupplier,
+                            java.util.function.Supplier<common.grpc.WorkerIdentity> identitySupplier) {
         this.workerId = workerId;
         this.executionEngine = new TaskExecutionEngine(workerId, threadPoolSize);
         this.workerService = new WorkerServiceImpl(workerId, executionEngine);
+        this.coordinatorService = new CoordinatorServiceImpl(
+                coordinatorManagerSupplier,
+                isCoordinatorSupplier,
+                identitySupplier != null ? identitySupplier : () -> common.grpc.WorkerIdentity.newBuilder()
+                        .setWorkerId(workerId)
+                        .setSessionId("worker-" + workerId)
+                        .build()
+        );
 
         this.server = ServerBuilder.forPort(port)
                 .addService(workerService)
+                .addService(coordinatorService)
                 .build();
     }
 
@@ -46,6 +64,10 @@ public class WorkerGrpcServer {
             server.shutdownNow();
             throw e;
         } finally {
+            try {
+                coordinatorService.close();
+            } catch (Exception ignored) {
+            }
             executionEngine.shutdown();
         }
     }
@@ -58,6 +80,10 @@ public class WorkerGrpcServer {
 
     public WorkerServiceImpl getWorkerService() {
         return workerService;
+    }
+
+    public CoordinatorServiceImpl getCoordinatorService() {
+        return coordinatorService;
     }
 
     public TaskExecutionEngine getExecutionEngine() {

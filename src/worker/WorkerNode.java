@@ -1,18 +1,10 @@
 package worker;
 
-import common.interfaces.BootstrapService;
 import common.interfaces.WorkerService;
 import common.models.ElectionMessage;
 import common.models.ElectionReply;
 import common.models.JobResult;
 import common.models.JobTask;
-import java.rmi.Naming;
-import java.rmi.RemoteException;
-import java.rmi.NoSuchObjectException;
-import java.rmi.registry.LocateRegistry;
-import java.rmi.registry.Registry;
-import java.rmi.server.UnicastRemoteObject;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -26,10 +18,8 @@ import worker.coordinator.CoordinatorManager;
 import worker.election.ElectionManager;
 import worker.grpc.WorkerGrpcServer;
 
-public class WorkerNode extends UnicastRemoteObject
-                implements WorkerService {
+public class WorkerNode implements WorkerService {
 
-        private static final long serialVersionUID = 1L;
         private final int workerId;
         private final String host;
         private final int port;
@@ -47,28 +37,38 @@ public class WorkerNode extends UnicastRemoteObject
         private final WorkerGrpcServer grpcServer;
         private final TaskExecutionEngine executionEngine;
         private final AtomicBoolean stopped = new AtomicBoolean();
+        private final String sessionId = java.util.UUID.randomUUID().toString();
 
         public WorkerNode(
                         int workerId,
                         String host,
-                        int port) throws RemoteException {
+                        int port) {
                 this(workerId, host, port, 0);
         }
 
-        public WorkerNode(int workerId, String host, int port, int grpcPort) throws RemoteException {
-
-                super();
+        public WorkerNode(int workerId, String host, int port, int grpcPort) {
 
                 this.workerId = workerId;
                 this.host = host;
                 this.port = port;
 
+                if (port < 1 || port > 65535 || grpcPort < 0 || grpcPort > 65535 || grpcPort == port) {
+                        throw new IllegalArgumentException("Worker ports require distinct valid range 1-65535; gRPC may use 0");
+                }
+
                 WorkerGrpcServer startingServer = null;
                 try {
-                        if (port < 1 || port > 65535 || grpcPort < 0 || grpcPort > 65535 || grpcPort == port) {
-                                throw new IllegalArgumentException("RMI and gRPC require distinct valid ports; gRPC may use 0");
-                        }
-                        startingServer = new WorkerGrpcServer(workerId, grpcPort, 4);
+                        startingServer = new WorkerGrpcServer(
+                                workerId,
+                                grpcPort,
+                                4,
+                                () -> this.coordinatorManager,
+                                () -> this.isCoordinator,
+                                () -> common.grpc.WorkerIdentity.newBuilder()
+                                        .setWorkerId(workerId)
+                                        .setSessionId(sessionId)
+                                        .build()
+                        );
                         startingServer.start();
                 } catch (Exception e) {
                         computationThreadPool.shutdownNow();
@@ -80,8 +80,7 @@ public class WorkerNode extends UnicastRemoteObject
                                         e.addSuppressed(interrupted);
                                 }
                         }
-                        UnicastRemoteObject.unexportObject(this, true);
-                        throw new RemoteException("Worker " + workerId + " gRPC startup failed on port " + grpcPort, e);
+                        throw new IllegalStateException("Worker " + workerId + " gRPC startup failed on port " + grpcPort, e);
                 }
                 this.grpcServer = startingServer;
                 this.executionEngine = startingServer.getExecutionEngine();
@@ -120,8 +119,7 @@ public class WorkerNode extends UnicastRemoteObject
         }
 
         @Override
-        public JobResult executeJob(JobTask task)
-                        throws RemoteException {
+        public JobResult executeJob(JobTask task) {
 
                 if (task == null) {
 
@@ -232,8 +230,7 @@ public class WorkerNode extends UnicastRemoteObject
 
         @Override
         public void receiveElectionMessage(
-                        ElectionMessage message)
-                        throws RemoteException {
+                        ElectionMessage message) {
 
                 if (message == null) {
                         return;
@@ -357,8 +354,7 @@ public class WorkerNode extends UnicastRemoteObject
 
         @Override
         public void receiveElectionReply(
-                        ElectionReply reply)
-                        throws RemoteException {
+                        ElectionReply reply) {
 
                 if (reply == null) {
                         return;
@@ -586,7 +582,7 @@ public class WorkerNode extends UnicastRemoteObject
         }
 
         private volatile String bootstrapHost = "localhost";
-        private volatile int bootstrapPort = 1099;
+        private volatile int bootstrapPort = 50050;
 
         public void connectToBootstrap(
                         String bootstrapHost,
@@ -595,56 +591,47 @@ public class WorkerNode extends UnicastRemoteObject
                 this.bootstrapHost = bootstrapHost;
                 this.bootstrapPort = bootstrapPort;
 
-                try {
+                // Pure gRPC Registration with Bootstrap
+                try (worker.grpc.BootstrapGrpcClient grpcClient = new worker.grpc.BootstrapGrpcClient(bootstrapHost, bootstrapPort)) {
+                        common.grpc.WorkerDescriptor descriptor = common.grpc.WorkerDescriptor.newBuilder()
+                                .setIdentity(common.grpc.WorkerIdentity.newBuilder()
+                                        .setWorkerId(workerId)
+                                        .setSessionId(sessionId)
+                                        .build())
+                                .setEndpoint(common.grpc.WorkerEndpoint.newBuilder()
+                                        .setHost(host)
+                                        .setPort(grpcServer != null ? grpcServer.getPort() : port)
+                                        .build())
+                                .build();
 
-                        BootstrapService bootstrap = (BootstrapService) Naming.lookup(
-                                        "rmi://" +
-                                                        bootstrapHost +
-                                                        ":" +
-                                                        bootstrapPort +
-                                                        "/BootstrapService");
+                        var regResponse = grpcClient.registerWorker(descriptor);
+                        var neighboursList = grpcClient.getInitialNeighbours(descriptor.getIdentity(), regResponse.getRegistryEpoch());
 
-                        bootstrap.registerWorker(
-                                        workerId,
-                                        host,
-                                        port);
-
-                        List<String> endpoints = bootstrap.getInitialNeighbors(
-                                        workerId);
-
-                        for (String endpoint : endpoints) {
-
-                                addNeighbourFromEndpoint(endpoint);
+                        for (common.grpc.WorkerDescriptor nDesc : neighboursList) {
+                                int nId = nDesc.getIdentity().getWorkerId();
+                                String nHost = nDesc.getEndpoint().getHost();
+                                int nPort = nDesc.getEndpoint().getPort();
+                                addNeighbourFromEndpoint(nId + "|" + nHost + "|" + nPort);
                         }
 
-                        System.out.println(
-                                        "Worker " + workerId +
-                                                        " connected to Bootstrap.");
-
-                        System.out.println(
-                                        "Neighbours: " +
-                                                        neighbours.keySet());
-
-                } catch (Exception e) {
-
-                        System.err.println(
-                                        "Bootstrap connection failed: " +
-                                                        e.getMessage());
+                        System.out.println("Worker " + workerId + " connected to Bootstrap via gRPC (port " + bootstrapPort + ").");
+                        System.out.println("Neighbours: " + neighbours.keySet());
+                } catch (Exception grpcEx) {
+                        System.err.println("Worker " + workerId + " failed to connect to Bootstrap via gRPC: " + grpcEx.getMessage());
                 }
         }
 
         @Override
-        public void addNeighbour(int neighbourId, WorkerService neighbour)
-                        throws RemoteException {
+        public void addNeighbour(int neighbourId, WorkerService neighbour) {
 
                 if (neighbourId <= 0) {
-                        throw new RemoteException("Neighbour ID must be greater than 0: " + neighbourId);
+                        throw new IllegalArgumentException("Neighbour ID must be greater than 0: " + neighbourId);
                 }
                 if (neighbourId == workerId) {
-                        throw new RemoteException("A worker cannot add itself as a neighbour");
+                        throw new IllegalArgumentException("A worker cannot add itself as a neighbour");
                 }
                 if (neighbour == null) {
-                        throw new RemoteException("Neighbour reference cannot be null");
+                        throw new IllegalArgumentException("Neighbour reference cannot be null");
                 }
 
                 neighbours.putIfAbsent(neighbourId, neighbour);
@@ -656,50 +643,56 @@ public class WorkerNode extends UnicastRemoteObject
                 try {
 
                         if (endpoint == null) {
-                                throw new RemoteException("Neighbour descriptor cannot be null");
+                                throw new IllegalArgumentException("Neighbour descriptor cannot be null");
                         }
 
                         String[] parts = endpoint.split("\\|", -1);
 
                         if (parts.length != 3) {
-                                throw new RemoteException("Expected neighbour descriptor workerId|host|port");
+                                throw new IllegalArgumentException("Expected neighbour descriptor workerId|host|port");
                         }
 
                         int id = Integer.parseInt(parts[0]);
 
                         if (id <= 0 || id == workerId) {
-                                throw new RemoteException("Invalid discovered neighbour ID: " + id);
+                                throw new IllegalArgumentException("Invalid discovered neighbour ID: " + id);
                         }
 
                         String workerHost = parts[1];
 
                         if (workerHost.isBlank()) {
-                                throw new RemoteException("Neighbour host cannot be blank");
+                                throw new IllegalArgumentException("Neighbour host cannot be blank");
                         }
 
                         int workerPort = Integer.parseInt(parts[2]);
 
                         if (workerPort <= 0 || workerPort > 65535) {
-                                throw new RemoteException("Invalid neighbour port: " + workerPort);
+                                throw new IllegalArgumentException("Invalid neighbour port: " + workerPort);
                         }
 
-                        Registry registry = LocateRegistry.getRegistry(
-                                        workerHost,
-                                        workerPort);
+                        // Connecting via pure gRPC peer client
+                        common.grpc.WorkerDescriptor desc = common.grpc.WorkerDescriptor.newBuilder()
+                                .setIdentity(common.grpc.WorkerIdentity.newBuilder()
+                                        .setWorkerId(id)
+                                        .setSessionId("worker-" + id)
+                                        .build())
+                                .setEndpoint(common.grpc.WorkerEndpoint.newBuilder()
+                                        .setHost(workerHost)
+                                        .setPort(workerPort)
+                                        .build())
+                                .build();
 
-                        WorkerService worker = (WorkerService) registry.lookup(
-                                        "Worker-" + id);
+                        worker.grpc.WorkerGrpcClient grpcClient = new worker.grpc.WorkerGrpcClient(
+                                desc,
+                                candId -> common.grpc.WorkerIdentity.newBuilder().setWorkerId(candId).setSessionId("worker-" + candId).build()
+                        );
 
-                        worker.addNeighbour(workerId, this);
-
-                        addNeighbour(
-                                        id,
-                                        worker);
-
-                        System.out.println(
-                                        "Worker " + workerId +
-                                                        " established bidirectional connection with Worker " +
-                                                        id);
+                        if (grpcClient.ping()) {
+                                addNeighbour(id, grpcClient);
+                                System.out.println("Worker " + workerId + " established gRPC neighbour connection with Worker " + id);
+                        } else {
+                                grpcClient.close();
+                        }
 
                 } catch (Exception e) {
 
@@ -721,7 +714,9 @@ public class WorkerNode extends UnicastRemoteObject
                         isCoordinator = true;
 
                         coordinatorManager = new CoordinatorManager(
-                                        jac.get());
+                                        workerId,
+                                        jac.get(),
+                                        currentTerm.get());
 
                         coordinatorManager.setTermExpiredListener(
                                         this::stepDownToWorker);
@@ -734,44 +729,41 @@ public class WorkerNode extends UnicastRemoteObject
                                 coordinatorManager.addWorker(worker);
                         }
 
-                        // Discover any additional reachable workers from bootstrap if available
+                        // 1. Publish Coordinator to Bootstrap via pure gRPC
+                        io.grpc.ManagedChannel bsChannel = null;
                         try {
-                                BootstrapService bootstrap = (BootstrapService) Naming.lookup(
-                                                "rmi://" + bootstrapHost + ":" + bootstrapPort + "/BootstrapService");
-                                List<String> endpoints = bootstrap.getInitialNeighbors(workerId);
-                                for (String ep : endpoints) {
-                                        addNeighbourFromEndpoint(ep);
-                                }
-                                for (WorkerService worker : neighbours.values()) {
-                                        coordinatorManager.addWorker(worker);
-                                }
-                        } catch (Exception ignored) {
-                        }
-
-                        // Register / rebind CoordinatorService in both the Bootstrap registry and local
-                        // worker registry
-                        try {
-                                Registry bootstrapRegistry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
-                                bootstrapRegistry.rebind("CoordinatorService", coordinatorManager);
-                                System.out.println("Worker " + workerId
-                                                + " bound CoordinatorService to Bootstrap registry (" + bootstrapHost
-                                                + ":" + bootstrapPort + ").");
+                                bsChannel = io.grpc.ManagedChannelBuilder.forAddress(bootstrapHost, bootstrapPort).usePlaintext().build();
+                                common.grpc.BootstrapServiceGrpc.BootstrapServiceBlockingStub bsStub = common.grpc.BootstrapServiceGrpc.newBlockingStub(bsChannel);
+                                bsStub.withDeadlineAfter(3, java.util.concurrent.TimeUnit.SECONDS).publishCoordinator(
+                                        common.grpc.PublishCoordinatorRequest.newBuilder()
+                                                .setCoordinator(common.grpc.CoordinatorRecord.newBuilder()
+                                                        .setCoordinator(common.grpc.WorkerDescriptor.newBuilder()
+                                                                .setIdentity(common.grpc.WorkerIdentity.newBuilder()
+                                                                        .setWorkerId(workerId)
+                                                                        .setSessionId(sessionId)
+                                                                        .build())
+                                                                .setEndpoint(common.grpc.WorkerEndpoint.newBuilder()
+                                                                        .setHost(host)
+                                                                        .setPort(grpcServer != null ? grpcServer.getPort() : port)
+                                                                        .build())
+                                                                .build())
+                                                        .setTerm(currentTerm.get())
+                                                        .build())
+                                                .build());
+                                System.out.println("Worker " + workerId + " published Coordinator identity to Bootstrap via gRPC.");
                         } catch (Exception e) {
-                                System.err.println("Could not bind CoordinatorService to Bootstrap registry: "
-                                                + e.getMessage());
-                        }
-
-                        try {
-                                Registry localRegistry = LocateRegistry.getRegistry(host, port);
-                                localRegistry.rebind("CoordinatorService", coordinatorManager);
-                        } catch (Exception ignored) {
+                                System.err.println("Could not publish coordinator to bootstrap via gRPC: " + e.getMessage());
+                        } finally {
+                                if (bsChannel != null) {
+                                        bsChannel.shutdown();
+                                }
                         }
 
                         System.out.println(
                                         "Worker " + workerId +
                                                         " is now coordinator.");
 
-                } catch (RemoteException e) {
+                } catch (Exception e) {
 
                         System.err.println(
                                         "Failed to become coordinator: " +
@@ -780,21 +772,6 @@ public class WorkerNode extends UnicastRemoteObject
         }
 
         public synchronized void stepDownToWorker() {
-
-                // Unbind CoordinatorService from registries upon stepping down
-                try {
-                        Registry bootstrapRegistry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
-                        bootstrapRegistry.unbind("CoordinatorService");
-                        System.out.println(
-                                        "Worker " + workerId + " unbound CoordinatorService from Bootstrap registry.");
-                } catch (Exception ignored) {
-                }
-
-                try {
-                        Registry localRegistry = LocateRegistry.getRegistry(host, port);
-                        localRegistry.unbind("CoordinatorService");
-                } catch (Exception ignored) {
-                }
 
                 if (coordinatorManager != null) {
 
@@ -857,15 +834,8 @@ public class WorkerNode extends UnicastRemoteObject
                         Thread.currentThread().interrupt();
                 } finally {
                         computationThreadPool.shutdownNow();
-                        try {
-                                if (coordinatorManager != null) {
-                                        UnicastRemoteObject.unexportObject(coordinatorManager, true);
-                                }
-                        } catch (NoSuchObjectException ignored) {
-                        }
-                        try {
-                                UnicastRemoteObject.unexportObject(this, true);
-                        } catch (NoSuchObjectException ignored) {
+                        if (coordinatorManager != null) {
+                                coordinatorManager.close();
                         }
                 }
         }
@@ -884,3 +854,4 @@ public class WorkerNode extends UnicastRemoteObject
                 }
         }
 }
+
