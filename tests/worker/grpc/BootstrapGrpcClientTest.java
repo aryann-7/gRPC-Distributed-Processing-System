@@ -112,6 +112,7 @@ public class BootstrapGrpcClientTest {
         StatusRuntimeException invalid = assertThrows(StatusRuntimeException.class,
                 () -> client.registerWorker(worker(0, "invalid")));
         assertEquals(Status.Code.INVALID_ARGUMENT, invalid.getStatus().getCode());
+        assertNotNull(invalid.getStatus().getDescription());
         assertFalse(invalid.getStatus().getDescription().isBlank());
         WorkerDescriptor worker = worker(101, "session");
         String epoch = client.registerWorker(worker).getRegistryEpoch();
