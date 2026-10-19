@@ -1,12 +1,12 @@
 
 package worker.election;
 
-import common.grpc.CoordinatorAnnouncement;
+import common.grpc.CoordinatorElectionAnnouncement;
+import common.grpc.CoordinatorElectionRequest;
+import common.grpc.CoordinatorElectionResponse;
 import common.grpc.CoordinatorElectionServiceGrpc;
 import common.grpc.CoordinatorStateRequest;
 import common.grpc.CoordinatorStateResponse;
-import common.grpc.ElectionRequest;
-import common.grpc.ElectionResponse;
 import common.grpc.TaskCheckpoint;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
@@ -50,11 +50,11 @@ public class CoordinatorElectionServiceImpl
 
     @Override
     public void startElection(
-            ElectionRequest request,
-            StreamObserver<ElectionResponse> observer) {
+            CoordinatorElectionRequest request,
+            StreamObserver<CoordinatorElectionResponse> observer) {
 
         if (request.getTerm() < currentTerm) {
-            observer.onNext(ElectionResponse.newBuilder()
+            observer.onNext(CoordinatorElectionResponse.newBuilder()
                     .setAccepted(false)
                     .setBestCandidateId(currentCoordinatorId)
                     .setBestCandidateJac(localJac)
@@ -85,7 +85,7 @@ public class CoordinatorElectionServiceImpl
 
         if (electionManager.isDuplicateAndMark(
                 request.getMessageId())) {
-            observer.onNext(ElectionResponse.newBuilder()
+            observer.onNext(CoordinatorElectionResponse.newBuilder()
                     .setAccepted(false)
                     .setBestCandidateId(localWorkerId)
                     .setBestCandidateJac(localJac)
@@ -100,7 +100,7 @@ public class CoordinatorElectionServiceImpl
                 electionManager.processElectionMessage(
                         incoming, localWorkerId, localJac);
 
-        observer.onNext(ElectionResponse.newBuilder()
+        observer.onNext(CoordinatorElectionResponse.newBuilder()
                 .setAccepted(true)
                 .setBestCandidateId(
                         best == null ? localWorkerId : best.getCandidateId())
@@ -115,11 +115,11 @@ public class CoordinatorElectionServiceImpl
 
     @Override
     public void announceCoordinator(
-            CoordinatorAnnouncement request,
-            StreamObserver<ElectionResponse> observer) {
+            CoordinatorElectionAnnouncement request,
+            StreamObserver<CoordinatorElectionResponse> observer) {
 
         if (request.getTerm() < currentTerm) {
-            observer.onNext(ElectionResponse.newBuilder()
+            observer.onNext(CoordinatorElectionResponse.newBuilder()
                     .setAccepted(false)
                     .setBestCandidateId(currentCoordinatorId)
                     .setBestCandidateJac(localJac)
@@ -133,7 +133,7 @@ public class CoordinatorElectionServiceImpl
         currentTerm = request.getTerm();
         currentCoordinatorId = request.getCoordinatorId();
 
-        observer.onNext(ElectionResponse.newBuilder()
+        observer.onNext(CoordinatorElectionResponse.newBuilder()
                 .setAccepted(true)
                 .setBestCandidateId(currentCoordinatorId)
                 .setBestCandidateJac(request.getCoordinatorJac())
