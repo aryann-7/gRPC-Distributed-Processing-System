@@ -88,11 +88,13 @@ public final class BootstrapGrpcServer implements AutoCloseable {
         }
     }
 
+    public static final int DEFAULT_PORT = 1099;
+
     public static void main(String[] args) throws Exception {
         if (args.length > 1) {
             throw new IllegalArgumentException("Usage: BootstrapGrpcServer [port]");
         }
-        int port = args.length == 0 ? BootstrapServer.DEFAULT_PORT : Integer.parseInt(args[0]);
+        int port = args.length == 0 ? DEFAULT_PORT : Integer.parseInt(args[0]);
         if (port < 1 || port > 65535) {
             throw new IllegalArgumentException("Bootstrap port must be between 1 and 65535");
         }
