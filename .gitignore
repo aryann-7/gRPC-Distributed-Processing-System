@@ -33,3 +33,7 @@ Desktop.ini
 
 .classpath
 .project
+
+# Runtime State & Shade files
+data/*.bin
+dependency-reduced-pom.xml
