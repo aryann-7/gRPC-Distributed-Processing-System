@@ -22,6 +22,8 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
     private final int workerId;
     private final ProgressListener progressListener;
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
+    private final java.util.concurrent.atomic.AtomicLong lastProcessedUnits = new java.util.concurrent.atomic.AtomicLong(0);
+    private final java.util.concurrent.atomic.AtomicLong lastTotalUnits = new java.util.concurrent.atomic.AtomicLong(0);
 
     // Number of evaluation steps between emitting progress updates over the network
     private static final int PROGRESS_BATCH_SIZE = 500;
@@ -38,6 +40,14 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
 
     public boolean isCancelled() {
         return cancelled.get();
+    }
+
+    public long getLastProcessedUnits() {
+        return lastProcessedUnits.get();
+    }
+
+    public long getLastTotalUnits() {
+        return lastTotalUnits.get();
     }
 
     @Override
@@ -64,6 +74,7 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            emitProgress(lastProcessedUnits.get(), lastTotalUnits.get(), "CANCELLED");
             return buildErrorResponse(jobId, taskId, "Task interrupted/cancelled: " + e.getMessage(), startTime);
         } catch (Exception e) {
             return buildErrorResponse(jobId, taskId, "Execution error: " + e.getMessage(), startTime);
@@ -211,6 +222,10 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
     }
 
     private void emitProgress(long processed, long total, String status) {
+        if (total > 0) {
+            lastProcessedUnits.set(processed);
+            lastTotalUnits.set(total);
+        }
         if (progressListener == null || total <= 0) {
             return;
         }

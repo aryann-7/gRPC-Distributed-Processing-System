@@ -3,7 +3,6 @@ package worker.computation;
 import common.grpc.CancelTaskRequest;
 import common.grpc.CancelTaskResponse;
 import common.grpc.TaskDispatchRequest;
-import common.grpc.TaskProgressUpdate;
 import common.grpc.TaskResultResponse;
 
 import java.util.Map;
