@@ -55,6 +55,16 @@ public final class BootstrapGrpcClient implements AutoCloseable {
                         .setRegistryEpoch(registryEpoch).build());
     }
 
+    public common.grpc.ListWorkersResponse listWorkers() {
+        return stub.withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .listWorkers(common.grpc.ListWorkersRequest.getDefaultInstance());
+    }
+
+    public common.grpc.GetCoordinatorResponse getCoordinator() {
+        return stub.withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .getCoordinator(common.grpc.GetCoordinatorRequest.getDefaultInstance());
+    }
+
     @Override
     public void close() {
         channel.shutdown();

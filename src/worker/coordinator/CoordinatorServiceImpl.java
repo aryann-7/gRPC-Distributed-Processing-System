@@ -7,8 +7,6 @@ import common.models.JobType;
 import io.grpc.Status;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
-
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -18,16 +16,20 @@ import java.util.function.Supplier;
  * gRPC service implementing CoordinatorService defined in coordinator.proto.
  *
  * Exposes:
- *  - SubmitJob: non-blocking job acceptance, async execution via CoordinatorManager.
- *  - WatchJob: server-streaming progress updates (QUEUED -> RUNNING -> COMPLETED/FAILED).
- *  - GetJobStatus: unary snapshot query for a given job ID.
- *  - GetCoordinatorStatus: metadata query for current coordinator state and terms.
+ * - SubmitJob: non-blocking job acceptance, async execution via
+ * CoordinatorManager.
+ * - WatchJob: server-streaming progress updates (QUEUED -> RUNNING ->
+ * COMPLETED/FAILED).
+ * - GetJobStatus: unary snapshot query for a given job ID.
+ * - GetCoordinatorStatus: metadata query for current coordinator state and
+ * terms.
  */
 public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorServiceImplBase implements AutoCloseable {
 
     private final Supplier<CoordinatorManager> coordinatorManagerSupplier;
     private final Supplier<Boolean> isCoordinatorSupplier;
     private final Supplier<WorkerIdentity> identitySupplier;
+    private final Runnable workerRefresher;
 
     private final Map<String, JobRecord> jobs = new ConcurrentHashMap<>();
     private final ExecutorService jobExecutor = Executors.newCachedThreadPool(r -> {
@@ -40,12 +42,24 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
             Supplier<CoordinatorManager> coordinatorManagerSupplier,
             Supplier<Boolean> isCoordinatorSupplier,
             Supplier<WorkerIdentity> identitySupplier) {
+        this(coordinatorManagerSupplier, isCoordinatorSupplier, identitySupplier, null);
+    }
+
+    public CoordinatorServiceImpl(
+            Supplier<CoordinatorManager> coordinatorManagerSupplier,
+            Supplier<Boolean> isCoordinatorSupplier,
+            Supplier<WorkerIdentity> identitySupplier,
+            Runnable workerRefresher) {
         this.coordinatorManagerSupplier = coordinatorManagerSupplier != null
-                ? coordinatorManagerSupplier : () -> null;
+                ? coordinatorManagerSupplier
+                : () -> null;
         this.isCoordinatorSupplier = isCoordinatorSupplier != null
-                ? isCoordinatorSupplier : () -> false;
+                ? isCoordinatorSupplier
+                : () -> false;
         this.identitySupplier = identitySupplier != null
-                ? identitySupplier : () -> WorkerIdentity.getDefaultInstance();
+                ? identitySupplier
+                : () -> WorkerIdentity.getDefaultInstance();
+        this.workerRefresher = workerRefresher;
     }
 
     public CoordinatorServiceImpl(
@@ -55,7 +69,7 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
         this(coordinatorManagerSupplier, isCoordinatorSupplier, () -> WorkerIdentity.newBuilder()
                 .setWorkerId(workerId)
                 .setSessionId("worker-" + workerId)
-                .build());
+                .build(), null);
     }
 
     @Override
@@ -137,6 +151,12 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
         responseObserver.onCompleted();
 
         jobExecutor.execute(() -> {
+            if (workerRefresher != null) {
+                try {
+                    workerRefresher.run();
+                } catch (Exception ignored) {
+                }
+            }
             record.state = JobStateProto.RUNNING;
             record.broadcast();
             try {
@@ -216,7 +236,7 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
 
     @Override
     public void getCoordinatorStatus(GetCoordinatorStatusRequest request,
-                                     StreamObserver<GetCoordinatorStatusResponse> responseObserver) {
+            StreamObserver<GetCoordinatorStatusResponse> responseObserver) {
         if (!Boolean.TRUE.equals(isCoordinatorSupplier.get()) || coordinatorManagerSupplier.get() == null) {
             responseObserver.onError(Status.FAILED_PRECONDITION
                     .withDescription("Worker is not the active coordinator")
@@ -246,7 +266,19 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
         jobExecutor.shutdownNow();
     }
 
-    private static class JobRecord {
+    private static class TaskProgress {
+        final WorkerIdentity worker;
+        final long unitsCompleted;
+        final long totalUnits;
+
+        TaskProgress(WorkerIdentity worker, long unitsCompleted, long totalUnits) {
+            this.worker = worker;
+            this.unitsCompleted = unitsCompleted;
+            this.totalUnits = totalUnits;
+        }
+    }
+
+    private class JobRecord {
         final String jobId;
         final SubmitJobRequest request;
         final long totalUnits;
@@ -258,7 +290,7 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
         volatile String errorMessage = null;
         volatile long executionTimeMs = 0;
 
-        final Map<Integer, WorkerJobProgress> workerProgressMap = new ConcurrentHashMap<>();
+        final Map<String, TaskProgress> taskProgressMap = new ConcurrentHashMap<>();
         final List<StreamObserver<JobProgress>> watchers = new CopyOnWriteArrayList<>();
 
         JobRecord(String jobId, SubmitJobRequest request, long totalUnits) {
@@ -269,8 +301,10 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
         }
 
         boolean matches(SubmitJobRequest other) {
-            if (request.getJobType() != other.getJobType()) return false;
-            if (request.getInputCase() != other.getInputCase()) return false;
+            if (request.getJobType() != other.getJobType())
+                return false;
+            if (request.getInputCase() != other.getInputCase())
+                return false;
             if (request.getInputCase() == SubmitJobRequest.InputCase.NUMBERS) {
                 return request.getNumbers().getNumbersList().equals(other.getNumbers().getNumbersList());
             } else if (request.getInputCase() == SubmitJobRequest.InputCase.RANGE) {
@@ -289,7 +323,26 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
                     .setExecutionTimeMs(state == JobStateProto.COMPLETED || state == JobStateProto.FAILED
                             ? executionTimeMs
                             : (System.currentTimeMillis() - submitTimeMs));
-            b.addAllWorkers(new ArrayList<>(workerProgressMap.values()));
+
+            Map<Integer, WorkerJobProgress.Builder> workerAggregates = new java.util.LinkedHashMap<>();
+            for (TaskProgress tp : taskProgressMap.values()) {
+                int wId = tp.worker.getWorkerId();
+                WorkerJobProgress.Builder existing = workerAggregates.get(wId);
+                if (existing == null) {
+                    workerAggregates.put(wId, WorkerJobProgress.newBuilder()
+                            .setWorker(tp.worker)
+                            .setUnitsCompleted(tp.unitsCompleted)
+                            .setTotalUnits(tp.totalUnits));
+                } else {
+                    existing.setUnitsCompleted(existing.getUnitsCompleted() + tp.unitsCompleted);
+                    existing.setTotalUnits(existing.getTotalUnits() + tp.totalUnits);
+                }
+            }
+
+            for (WorkerJobProgress.Builder wb : workerAggregates.values()) {
+                b.addWorkers(wb.build());
+            }
+
             if (state == JobStateProto.COMPLETED && resultValue != null) {
                 b.setResultValue(resultValue);
             } else if (state == JobStateProto.FAILED && errorMessage != null) {
@@ -314,13 +367,24 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
             this.resultValue = result;
             this.executionTimeMs = execTime;
             this.unitsCompleted = totalUnits;
-            // Ensure any reported workers reflect 100% completion in the final snapshot
-            for (Map.Entry<Integer, WorkerJobProgress> entry : workerProgressMap.entrySet()) {
-                WorkerJobProgress wp = entry.getValue();
-                if (wp.getUnitsCompleted() < wp.getTotalUnits()) {
-                    entry.setValue(wp.toBuilder().setUnitsCompleted(wp.getTotalUnits()).build());
+
+            // Ensure any reported tasks reflect 100% completion in the final snapshot
+            for (Map.Entry<String, TaskProgress> entry : taskProgressMap.entrySet()) {
+                TaskProgress tp = entry.getValue();
+                if (tp.unitsCompleted < tp.totalUnits) {
+                    entry.setValue(new TaskProgress(tp.worker, tp.totalUnits, tp.totalUnits));
                 }
             }
+
+            // Fallback: If no subtasks were tracked individually, attribute full completion
+            // to self/coordinator
+            if (taskProgressMap.isEmpty()) {
+                WorkerIdentity self = identitySupplier != null ? identitySupplier.get() : null;
+                if (self != null && self.getWorkerId() > 0) {
+                    taskProgressMap.put(jobId + "-task-1", new TaskProgress(self, totalUnits, totalUnits));
+                }
+            }
+
             JobProgress progress = toProto();
             for (StreamObserver<JobProgress> watcher : watchers) {
                 try {
@@ -348,13 +412,13 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
         }
 
         synchronized void onTaskProgress(WorkerIdentity worker, TaskProgressUpdate update) {
-            workerProgressMap.put(worker.getWorkerId(), WorkerJobProgress.newBuilder()
-                    .setWorker(worker)
-                    .setUnitsCompleted(update.getUnitsCompleted())
-                    .setTotalUnits(update.getTotalUnits())
-                    .build());
-            long sumCompleted = workerProgressMap.values().stream()
-                    .mapToLong(WorkerJobProgress::getUnitsCompleted).sum();
+            String taskId = update.getTaskId() != null && !update.getTaskId().isEmpty()
+                    ? update.getTaskId()
+                    : ("task-worker-" + worker.getWorkerId());
+            taskProgressMap.put(taskId, new TaskProgress(worker, update.getUnitsCompleted(), update.getTotalUnits()));
+
+            long sumCompleted = taskProgressMap.values().stream()
+                    .mapToLong(tp -> tp.unitsCompleted).sum();
             this.unitsCompleted = Math.min(totalUnits, sumCompleted);
             if (this.state == JobStateProto.QUEUED) {
                 this.state = JobStateProto.RUNNING;
