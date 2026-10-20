@@ -20,13 +20,34 @@ public class WorkerGrpcServer {
     private final TaskExecutionEngine executionEngine;
 
     public WorkerGrpcServer(int workerId, int port, int threadPoolSize) {
-        this(workerId, port, threadPoolSize, null, null, null);
+        this(workerId, port, threadPoolSize, null, null, null, null, null, null);
     }
 
     public WorkerGrpcServer(int workerId, int port, int threadPoolSize,
                             java.util.function.Supplier<worker.coordinator.CoordinatorManager> coordinatorManagerSupplier,
                             java.util.function.Supplier<Boolean> isCoordinatorSupplier,
                             java.util.function.Supplier<common.grpc.WorkerIdentity> identitySupplier) {
+        this(workerId, port, threadPoolSize, coordinatorManagerSupplier, isCoordinatorSupplier, identitySupplier, null, null, null);
+    }
+
+    public WorkerGrpcServer(int workerId, int port, int threadPoolSize,
+                            java.util.function.Supplier<worker.coordinator.CoordinatorManager> coordinatorManagerSupplier,
+                            java.util.function.Supplier<Boolean> isCoordinatorSupplier,
+                            java.util.function.Supplier<common.grpc.WorkerIdentity> identitySupplier,
+                            java.util.function.Consumer<common.models.ElectionMessage> electionMessageConsumer,
+                            java.util.function.Consumer<common.models.ElectionReply> electionReplyConsumer,
+                            java.util.concurrent.ConcurrentMap<Integer, common.grpc.WorkerDescriptor> neighbours) {
+        this(workerId, port, threadPoolSize, coordinatorManagerSupplier, isCoordinatorSupplier, identitySupplier, electionMessageConsumer, electionReplyConsumer, neighbours, null);
+    }
+
+    public WorkerGrpcServer(int workerId, int port, int threadPoolSize,
+                            java.util.function.Supplier<worker.coordinator.CoordinatorManager> coordinatorManagerSupplier,
+                            java.util.function.Supplier<Boolean> isCoordinatorSupplier,
+                            java.util.function.Supplier<common.grpc.WorkerIdentity> identitySupplier,
+                            java.util.function.Consumer<common.models.ElectionMessage> electionMessageConsumer,
+                            java.util.function.Consumer<common.models.ElectionReply> electionReplyConsumer,
+                            java.util.concurrent.ConcurrentMap<Integer, common.grpc.WorkerDescriptor> neighbours,
+                            Runnable workerRefresher) {
         this.workerId = workerId;
         this.executionEngine = new TaskExecutionEngine(workerId, threadPoolSize);
         this.workerService = new WorkerServiceImpl(workerId, executionEngine);
@@ -36,12 +57,15 @@ public class WorkerGrpcServer {
                 identitySupplier != null ? identitySupplier : () -> common.grpc.WorkerIdentity.newBuilder()
                         .setWorkerId(workerId)
                         .setSessionId("worker-" + workerId)
-                        .build()
+                        .build(),
+                workerRefresher
         );
 
         this.server = ServerBuilder.forPort(port)
                 .addService(workerService)
                 .addService(coordinatorService)
+                .addService(new ElectionGrpcService(electionMessageConsumer, electionReplyConsumer))
+                .addService(new PeerGrpcService(workerId, neighbours != null ? neighbours : new java.util.concurrent.ConcurrentHashMap<>()))
                 .build();
     }
 

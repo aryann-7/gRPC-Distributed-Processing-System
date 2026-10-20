@@ -21,11 +21,14 @@ public class WorkerGrpcServerTest {
     private ManagedChannel channel;
     private WorkerServiceGrpc.WorkerServiceStub asyncStub;
     private WorkerServiceGrpc.WorkerServiceBlockingStub blockingStub;
-    private final int testPort = 50051;
+    private int testPort;
     private final int workerId = 101;
 
     @BeforeEach
     public void setUp() throws Exception {
+        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+            testPort = s.getLocalPort();
+        }
         server = new WorkerGrpcServer(workerId, testPort, 4);
         server.start();
 
