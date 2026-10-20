@@ -32,46 +32,49 @@ echo =========================================================================
 echo Cluster Configuration: %NUM_WORKERS% Workers (IDs 101-%NUM_WORKERS%), %NUM_CLIENTS% Clients
 echo =========================================================================
 
-echo [1/6] Cleaning previous build artifacts...
-if exist bin rd /s /q bin
-mkdir bin
-
-echo [2/6] Compiling Java source files...
-javac -d bin src\common\models\*.java src\common\interfaces\*.java src\bootstrap\*.java src\worker\election\*.java src\worker\computation\*.java src\worker\coordinator\*.java src\worker\*.java src\client\parser\*.java src\client\gui\*.java src\client\*.java
+echo [1/5] Building project packages via Maven...
+call mvn clean package -DskipTests
 if %ERRORLEVEL% NEQ 0 (
-    echo Compilation failed!
+    echo Maven build failed!
     exit /b %ERRORLEVEL%
 )
-echo Compilation successful.
 
-echo [3/6] Starting RMI Registry on port 1099...
-start "RMI Registry" rmiregistry -J-cp -Jbin 1099
+echo Building client package...
+cd client
+call mvn clean package -DskipTests
+cd ..
+if %ERRORLEVEL% NEQ 0 (
+    echo Client build failed!
+    exit /b %ERRORLEVEL%
+)
+echo Build successful.
 
-timeout /t 2 /nobreak >nul
+echo [2/5] Launching Bootstrap gRPC Server on port 50050...
+start "Bootstrap gRPC Server" java -jar target\bootstrap-server.jar 50050
 
-echo [4/6] Launching Bootstrap Server...
-start "Bootstrap Server" java -cp bin bootstrap.BootstrapServer
+timeout /t 3 /nobreak >nul
 
-timeout /t 2 /nobreak >nul
-
-echo [5/6] Launching %NUM_WORKERS% Worker Nodes dynamically...
+echo [3/5] Launching %NUM_WORKERS% Worker Nodes dynamically...
 for /L %%i in (1,1,%NUM_WORKERS%) do (
     set /a W_ID=100 + %%i
-    set /a W_PORT=1100 + %%i
-    echo Starting Worker-!W_ID! on port !W_PORT!...
-    start "Worker-!W_ID!" java -cp bin worker.WorkerMain !W_ID! localhost !W_PORT! localhost 1099
+    set /a W_RMI=1100 + %%i
+    set /a W_GRPC=50050 + %%i
+    echo Starting Worker-!W_ID! (gRPC Port: !W_GRPC!)...
+    start "Worker-!W_ID!" java -jar target\worker-node.jar !W_ID! localhost !W_RMI! localhost 50050 !W_GRPC!
+    echo !W_ID! > "%~dp0cluster_state.txt"
     timeout /t 1 /nobreak >nul
 )
 
-timeout /t 2 /nobreak >nul
+timeout /t 3 /nobreak >nul
 
-echo [6/6] Launching %NUM_CLIENTS% Client GUI instances...
+echo [4/5] Launching %NUM_CLIENTS% Client GUI instances connected to Bootstrap (50050)...
 for /L %%c in (1,1,%NUM_CLIENTS%) do (
     echo Starting Client GUI #%%c...
-    start "Client GUI #%%c" java -cp bin client.ClientMain %%c
+    start "Client GUI #%%c" java -jar client\target\distrilab-client.jar %%c localhost 50050
+    echo %%c > "%~dp0client_state.txt"
     timeout /t 1 /nobreak >nul
 )
 
 echo =========================================================================
-echo Cluster launched successfully with %NUM_WORKERS% workers and %NUM_CLIENTS% clients.
+echo gRPC Cluster launched successfully with %NUM_WORKERS% workers and %NUM_CLIENTS% clients.
 echo =========================================================================

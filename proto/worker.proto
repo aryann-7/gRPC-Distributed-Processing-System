@@ -128,14 +128,14 @@ service WorkerService {
 }
 
 
-message ElectionRequest {
+message CoordinatorElectionRequest {
     int32 candidate_id = 1;
     int32 candidate_jac = 2;
     int32 term = 3;
     string message_id = 4;
 }
 
-message ElectionResponse {
+message CoordinatorElectionResponse {
     bool accepted = 1;
     int32 best_candidate_id = 2;
     int32 best_candidate_jac = 3;
@@ -143,7 +143,7 @@ message ElectionResponse {
     string message = 5;
 }
 
-message CoordinatorAnnouncement {
+message CoordinatorElectionAnnouncement {
     int32 coordinator_id = 1;
     int32 coordinator_jac = 2;
     int32 term = 3;
@@ -170,9 +170,9 @@ message CoordinatorStateResponse {
 }
 
 service CoordinatorElectionService {
-    rpc StartElection(ElectionRequest) returns (ElectionResponse);
-    rpc AnnounceCoordinator(CoordinatorAnnouncement)
-        returns (ElectionResponse);
+    rpc StartElection(CoordinatorElectionRequest) returns (CoordinatorElectionResponse);
+    rpc AnnounceCoordinator(CoordinatorElectionAnnouncement)
+        returns (CoordinatorElectionResponse);
     rpc GetCoordinatorState(CoordinatorStateRequest)
         returns (CoordinatorStateResponse);
 }

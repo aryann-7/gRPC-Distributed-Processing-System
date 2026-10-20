@@ -42,7 +42,14 @@ public class WorkerBreakdownDialog extends JDialog {
                 case 1: return p.unitsCompleted();
                 case 2: return p.totalUnits();
                 case 3: return p.percent();
-                case 4: return p.isDone() ? "Done" : "Working";
+                case 4:
+                    if (p.isDone()) {
+                        return "Done";
+                    } else if (job.getState() == JobProgressTracker.State.FAILED) {
+                        return "Aborted";
+                    } else {
+                        return "Working";
+                    }
                 default: return "";
             }
         }

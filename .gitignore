@@ -33,3 +33,9 @@ Desktop.ini
 
 .classpath
 .project
+
+# Runtime State & Shade files
+data/*.bin
+dependency-reduced-pom.xml
+scripts/cluster_state.txt
+scripts/client_state.txt

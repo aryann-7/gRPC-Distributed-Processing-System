@@ -1,10 +1,10 @@
 
 package worker.election;
 
-import common.grpc.CoordinatorAnnouncement;
+import common.grpc.CoordinatorElectionAnnouncement;
+import common.grpc.CoordinatorElectionRequest;
+import common.grpc.CoordinatorElectionResponse;
 import common.grpc.CoordinatorStateRequest;
-import common.grpc.ElectionRequest;
-import common.grpc.ElectionResponse;
 import common.grpc.CoordinatorStateResponse;
 import io.grpc.stub.StreamObserver;
 import org.junit.jupiter.api.Test;
@@ -61,14 +61,14 @@ class CoordinatorElectionServiceImplTest {
 
         CoordinatorElectionServiceImpl service = createService();
 
-        CoordinatorAnnouncement request =
-                CoordinatorAnnouncement.newBuilder()
+        CoordinatorElectionAnnouncement request =
+                CoordinatorElectionAnnouncement.newBuilder()
                         .setCoordinatorId(4)
                         .setCoordinatorJac(0)
                         .setTerm(2)
                         .build();
 
-        ResultObserver<ElectionResponse> observer =
+        ResultObserver<CoordinatorElectionResponse> observer =
                 new ResultObserver<>();
 
         service.announceCoordinator(request, observer);
@@ -87,22 +87,22 @@ class CoordinatorElectionServiceImplTest {
 
         CoordinatorElectionServiceImpl service = createService();
 
-        ResultObserver<ElectionResponse> first =
+        ResultObserver<CoordinatorElectionResponse> first =
                 new ResultObserver<>();
 
         service.announceCoordinator(
-                CoordinatorAnnouncement.newBuilder()
+                CoordinatorElectionAnnouncement.newBuilder()
                         .setCoordinatorId(4)
                         .setCoordinatorJac(0)
                         .setTerm(3)
                         .build(),
                 first);
 
-        ResultObserver<ElectionResponse> stale =
+        ResultObserver<CoordinatorElectionResponse> stale =
                 new ResultObserver<>();
 
         service.announceCoordinator(
-                CoordinatorAnnouncement.newBuilder()
+                CoordinatorElectionAnnouncement.newBuilder()
                         .setCoordinatorId(8)
                         .setCoordinatorJac(2)
                         .setTerm(2)
@@ -139,11 +139,11 @@ class CoordinatorElectionServiceImplTest {
     void processesAnElectionRequest() throws Exception {
         CoordinatorElectionServiceImpl service = createService();
 
-        ResultObserver<ElectionResponse> observer =
+        ResultObserver<CoordinatorElectionResponse> observer =
                 new ResultObserver<>();
 
         service.startElection(
-                ElectionRequest.newBuilder()
+                CoordinatorElectionRequest.newBuilder()
                         .setCandidateId(6)
                         .setCandidateJac(1)
                         .setTerm(2)

@@ -4,13 +4,10 @@ import common.interfaces.CoordinatorService;
 import common.models.CoordinatorMessage;
 import common.models.JobRequest;
 import common.models.JobResult;
-import java.rmi.RemoteException;
-import java.rmi.server.UnicastRemoteObject;
+import worker.recovery.WorkerFailureDetector.Health;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class CoordinatorManager extends UnicastRemoteObject implements CoordinatorService, AutoCloseable {
-
-    private static final long serialVersionUID = 1L;
+public class CoordinatorManager implements CoordinatorService, AutoCloseable {
 
     public static final int MAX_JOBS_PER_TERM = 5;
 
@@ -23,9 +20,52 @@ public class CoordinatorManager extends UnicastRemoteObject implements Coordinat
 
     private final AtomicInteger currentTerm = new AtomicInteger(1);
 
-    public CoordinatorManager(int initialJac) throws RemoteException {
-        super();
+    private final int coordinatorId;
+    private final worker.recovery.CoordinatorStateStore stateStore;
+    private final worker.recovery.TaskLedger taskLedger;
+    private final worker.recovery.WorkerFailureDetector failureDetector;
+
+    public CoordinatorManager(int initialJac) {
+        this(0, initialJac, 1, null, null);
+    }
+
+    public CoordinatorManager(int coordinatorId, int initialJac, int term) {
+        this(coordinatorId, initialJac, term, null, null);
+    }
+
+    public CoordinatorManager(int coordinatorId, int initialJac, int term,
+                              worker.recovery.TaskLedger ledger,
+                              worker.recovery.WorkerFailureDetector detector) {
+        this.coordinatorId = coordinatorId;
         this.persistentJac = new AtomicInteger(initialJac);
+        this.currentTerm.set(term);
+
+        if (detector != null) {
+            this.failureDetector = detector;
+        } else {
+            this.failureDetector = new worker.recovery.WorkerFailureDetector(2000, 2);
+        }
+
+        if (ledger != null) {
+            this.stateStore = null;
+            this.taskLedger = ledger;
+        } else {
+            java.nio.file.Path statePath = java.nio.file.Paths.get("data", "coordinator-" + coordinatorId + "-state.bin");
+            this.stateStore = new worker.recovery.CoordinatorStateStore(statePath);
+            this.taskLedger = new worker.recovery.TaskLedger(stateStore, coordinatorId, term, initialJac);
+        }
+    }
+
+    public int getCoordinatorId() {
+        return coordinatorId;
+    }
+
+    public worker.recovery.TaskLedger getTaskLedger() {
+        return taskLedger;
+    }
+
+    public worker.recovery.WorkerFailureDetector getFailureDetector() {
+        return failureDetector;
     }
 
     private Runnable termExpiredListener;
@@ -59,12 +99,12 @@ public class CoordinatorManager extends UnicastRemoteObject implements Coordinat
     }
 
     @Override
-    public JobResult submitJob(JobRequest request) throws RemoteException {
+    public JobResult submitJob(JobRequest request) {
         return submitJob(request, (worker, update) -> {});
     }
 
     public JobResult submitJob(JobRequest request,
-            java.util.function.BiConsumer<common.grpc.WorkerIdentity, common.grpc.TaskProgressUpdate> progress) throws RemoteException {
+            java.util.function.BiConsumer<common.grpc.WorkerIdentity, common.grpc.TaskProgressUpdate> progress) {
         long startTime = System.currentTimeMillis();
         JobResult finalResult = new JobResult();
 
@@ -116,51 +156,150 @@ public class CoordinatorManager extends UnicastRemoteObject implements Coordinat
                 return finalResult;
         }
 
-        java.util.List<java.util.concurrent.Future<JobResult>> futures = new java.util.ArrayList<>();
-        int workersAssignedCount = 0;
-
-        for (int i = 0; i < tasks.size(); i++) {
-            common.models.JobTask task = tasks.get(i);
-            common.interfaces.WorkerService worker = activeWorkers.get(i % numWorkers);
-            workersAssignedCount++;
-
-            futures.add(dispatchPool.submit(() -> {
-                try {
-                    if (worker instanceof worker.grpc.WorkerGrpcClient client) {
-                        return client.executeJob(task, update -> progress.accept(client.descriptor().getIdentity(), update));
-                    }
-                    return worker.executeJob(task);
-                } catch (Exception e) {
-                    JobResult err = new JobResult();
-                    err.setJobId(task.getJobId());
-                    err.setTaskId(task.getTaskId());
-                    err.setSuccess(false);
-                    err.setErrorMessage("Worker RPC failed: " + e.getMessage());
-                    return err;
-                }
-            }));
-        }
-
-        java.util.List<JobResult> subResults = new java.util.ArrayList<>();
-        for (java.util.concurrent.Future<JobResult> future : futures) {
+        // Register tasks in TaskLedger
+        for (common.models.JobTask task : tasks) {
             try {
-                JobResult res = future.get();
-                if (res != null && !res.isSuccess()) {
-                    finalResult.setSuccess(false);
-                    finalResult.setErrorMessage("Subtask failure: " + res.getErrorMessage());
-                    return finalResult;
-                }
-                subResults.add(res);
-            } catch (Exception e) {
-                finalResult.setSuccess(false);
-                finalResult.setErrorMessage("Execution interrupted or failed: " + e.getMessage());
-                return finalResult;
+                taskLedger.addTask(task.getJobId(), task.getTaskId());
+            } catch (Exception ignored) {
             }
         }
 
-        aggregateResults(request.getJobType(), subResults, finalResult);
+        java.util.List<JobResult> subResults = new java.util.concurrent.CopyOnWriteArrayList<>();
+        java.util.concurrent.atomic.AtomicInteger workersAssignedCounter = new java.util.concurrent.atomic.AtomicInteger(0);
+        java.util.concurrent.ConcurrentLinkedQueue<common.models.JobTask> pendingQueue =
+                new java.util.concurrent.ConcurrentLinkedQueue<>(tasks);
 
-        if (workersAssignedCount > 0) {
+        java.util.concurrent.atomic.AtomicInteger nextWorkerIdx = new java.util.concurrent.atomic.AtomicInteger(0);
+
+        // Process all tasks, retrying / reassigning on failure to surviving workers
+        java.util.List<java.util.concurrent.Future<?>> dispatchFutures = new java.util.ArrayList<>();
+
+        // We launch initial task dispatches
+        int taskCount = tasks.size();
+        java.util.concurrent.CountDownLatch completionLatch = new java.util.concurrent.CountDownLatch(taskCount);
+        java.util.concurrent.atomic.AtomicBoolean fatalError = new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.concurrent.atomic.AtomicReference<String> fatalMessage = new java.util.concurrent.atomic.AtomicReference<>(null);
+
+        Runnable dispatchNextTask = new Runnable() {
+            @Override
+            public void run() {
+                common.models.JobTask currentTask = pendingQueue.poll();
+                if (currentTask == null) {
+                    return;
+                }
+
+                // Pick an active worker that is healthy
+                java.util.List<common.interfaces.WorkerService> workers = new java.util.ArrayList<>(activeWorkers);
+                if (workers.isEmpty()) {
+                    fatalError.set(true);
+                    fatalMessage.set("No active workers remaining to process task " + currentTask.getTaskId());
+                    while (completionLatch.getCount() > 0) {
+                        completionLatch.countDown();
+                    }
+                    return;
+                }
+
+                int chosenIdx = Math.abs(nextWorkerIdx.getAndIncrement() % workers.size());
+                common.interfaces.WorkerService worker = workers.get(chosenIdx);
+                int workerId = getWorkerId(worker, chosenIdx);
+
+                try {
+                    taskLedger.assignTask(currentTask.getTaskId(), workerId);
+                } catch (Exception ignored) {
+                }
+                workersAssignedCounter.incrementAndGet();
+
+                long rpcStart = System.currentTimeMillis();
+                try {
+                    JobResult res;
+                    if (worker instanceof worker.grpc.WorkerGrpcClient client) {
+                        res = client.executeJob(currentTask, update -> progress.accept(client.descriptor().getIdentity(), update));
+                    } else {
+                        res = worker.executeJob(currentTask);
+                    }
+
+                    long rpcDuration = System.currentTimeMillis() - rpcStart;
+
+                    if (res != null && res.isSuccess()) {
+                        failureDetector.recordHeartbeat(workerId, rpcDuration);
+                        try {
+                            taskLedger.completeTask(currentTask.getTaskId(), workerId, res.getResultValue());
+                        } catch (Exception ignored) {
+                        }
+                        subResults.add(res);
+                        completionLatch.countDown();
+                    } else {
+                        // Worker returned failure or error
+                        failureDetector.recordMissedHeartbeat(workerId);
+                        handleTaskFailure(currentTask, worker, workerId, res != null ? res.getErrorMessage() : "RPC failed", this);
+                    }
+                } catch (Exception e) {
+                    // Worker timed out or threw network exception
+                    failureDetector.recordMissedHeartbeat(workerId);
+                    handleTaskFailure(currentTask, worker, workerId, e.getMessage(), this);
+                }
+            }
+
+            private void handleTaskFailure(common.models.JobTask currentTask,
+                                           common.interfaces.WorkerService worker,
+                                           int workerId,
+                                           String reason,
+                                           Runnable runner) {
+                System.err.println("Task " + currentTask.getTaskId() + " failed on worker " + workerId
+                        + " (" + reason + "). Reassigning to surviving worker...");
+                try {
+                    taskLedger.requeueWorkerTasks(workerId);
+                } catch (Exception ignored) {
+                }
+
+                if (failureDetector.getHealth(workerId) == Health.SUSPECTED_FAILED) {
+                    removeWorker(worker);
+                }
+
+                // Check surviving workers
+                if (activeWorkers.isEmpty()) {
+                    fatalError.set(true);
+                    fatalMessage.set("All workers failed; could not complete " + currentTask.getTaskId()
+                            + (reason != null ? " (" + reason + ")" : ""));
+                    while (completionLatch.getCount() > 0) {
+                        completionLatch.countDown();
+                    }
+                    return;
+                }
+
+                // Re-enqueue task and submit to dispatch pool
+                pendingQueue.offer(currentTask);
+                dispatchPool.submit(runner);
+            }
+        };
+
+        for (int i = 0; i < taskCount; i++) {
+            dispatchFutures.add(dispatchPool.submit(dispatchNextTask));
+        }
+
+        try {
+            boolean done = completionLatch.await(10, java.util.concurrent.TimeUnit.MINUTES);
+            if (!done) {
+                finalResult.setSuccess(false);
+                finalResult.setErrorMessage("Timed out waiting for subtasks to finish");
+                return finalResult;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            finalResult.setSuccess(false);
+            finalResult.setErrorMessage("Coordinator execution interrupted: " + e.getMessage());
+            return finalResult;
+        }
+
+        if (fatalError.get()) {
+            finalResult.setSuccess(false);
+            finalResult.setErrorMessage(fatalMessage.get());
+            return finalResult;
+        }
+
+        aggregateResults(request.getJobType(), new java.util.ArrayList<>(subResults), finalResult);
+
+        if (workersAssignedCounter.get() > 0) {
             persistentJac.incrementAndGet();
         }
         termJobCount.incrementAndGet();
@@ -173,6 +312,21 @@ public class CoordinatorManager extends UnicastRemoteObject implements Coordinat
         }
 
         return finalResult;
+    }
+
+    private int getWorkerId(common.interfaces.WorkerService worker, int fallbackIdx) {
+        if (worker instanceof worker.grpc.WorkerGrpcClient client) {
+            return client.descriptor().getIdentity().getWorkerId();
+        }
+        if (worker instanceof worker.WorkerNode node) {
+            return node.getWorkerId();
+        }
+        try {
+            java.lang.reflect.Method m = worker.getClass().getMethod("getWorkerId");
+            return (Integer) m.invoke(worker);
+        } catch (Exception ignored) {
+        }
+        return fallbackIdx;
     }
 
     private java.util.List<java.util.List<Long>> partitionList(java.util.List<Long> numbers, int numChunks) {
@@ -265,13 +419,12 @@ public class CoordinatorManager extends UnicastRemoteObject implements Coordinat
     }
 
     @Override
-    public void handleCoordinatorMessage(CoordinatorMessage message) throws RemoteException {
+    public void handleCoordinatorMessage(CoordinatorMessage message) {
 
     }
 
    @Override
-   public String getCoordinatorStatus()
-        throws RemoteException {
+   public String getCoordinatorStatus() {
 
     return "Term=" + currentTerm.get()
             + ", JobsAssigned="
@@ -298,10 +451,21 @@ public class CoordinatorManager extends UnicastRemoteObject implements Coordinat
         return persistentJac.get();
     }
 
+    public int getCurrentTerm() {
+        return currentTerm.get();
+    }
+
+    public void setCurrentTerm(int term) {
+        this.currentTerm.set(term);
+    }
+
+    public int getTermJobCount() {
+        return termJobCount.get();
+    }
+
     @Override
     public void close() {
         dispatchPool.shutdownNow();
-        try { UnicastRemoteObject.unexportObject(this, true); }
-        catch (java.rmi.NoSuchObjectException ignored) { }
     }
 }
+

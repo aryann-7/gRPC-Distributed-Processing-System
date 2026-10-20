@@ -3,43 +3,48 @@ setlocal enabledelayedexpansion
 
 REM =========================================================================
 REM CS324 Add Dynamic Worker Script (Windows)
-REM =========================================================================
-REM Usage:
-REM   add_worker.bat <workerId> [port] [bootstrapHost] [bootstrapPort]
-REM Examples:
-REM   add_worker.bat 104
-REM   add_worker.bat 104 1104
-REM   add_worker.bat 105 1105 localhost 1099
+REM Automatically creates and connects one new worker without user input.
+REM Auto-increments workerId and auto-assigns the next free gRPC port.
 REM =========================================================================
 
-set W_ID=%1
-if "%W_ID%"=="" (
-    echo Usage: add_worker.bat ^<workerId^> [port] [bootstrapHost] [bootstrapPort]
-    echo Example: add_worker.bat 104 1104
-    exit /b 1
-)
+set STATE_FILE=%~dp0cluster_state.txt
+set BS_HOST=localhost
+set BS_PORT=50050
 
-set W_PORT=%2
-if "%W_PORT%"=="" (
-    REM Default port convention: 1000 + (workerId - 100) or 1000 + workerId
-    if %W_ID% GEQ 100 (
-        set /a W_PORT=1000 + %W_ID%
-    ) else (
-        set /a W_PORT=1100 + %W_ID%
+REM 1. Determine base worker ID (default start after initial 3-worker cluster = 104)
+set NEXT_ID=104
+if exist "%STATE_FILE%" (
+    set /p LAST_ID=<"%STATE_FILE%"
+    REM Strip potential trailing spaces
+    for /f "tokens=1" %%a in ("!LAST_ID!") do set LAST_ID=%%a
+    if not "!LAST_ID!"=="" (
+        set /a NEXT_ID=!LAST_ID! + 1
     )
 )
 
-set BS_HOST=%3
-if "%BS_HOST%"=="" set BS_HOST=localhost
+REM 2. Allow optional CLI overrides if explicitly passed, otherwise use auto-calculated
+if not "%1"=="" set NEXT_ID=%1
 
-set BS_PORT=%4
-if "%BS_PORT%"=="" set BS_PORT=1099
+set W_ID=%NEXT_ID%
+set /a W_RMI=1100 + %W_ID%
+set /a W_GRPC=50050 + (%W_ID% - 100)
+
+REM Optional argument overrides
+if not "%2"=="" set W_GRPC=%2
+if not "%3"=="" set BS_HOST=%3
+if not "%4"=="" set BS_PORT=%4
+
+REM 3. Persist the newly allocated worker ID so consecutive executions auto-increment
+echo %W_ID% > "%STATE_FILE%"
 
 echo =========================================================================
-echo Dynamically joining Worker-%W_ID% to cluster...
-echo Host: localhost, Port: %W_PORT%, Bootstrap: %BS_HOST%:%BS_PORT%
+echo [Auto-Add Worker] Spawning Worker-%W_ID%...
+echo Assigned Worker ID : %W_ID%
+echo Internal Port      : %W_RMI%
+echo gRPC Port          : %W_GRPC%
+echo Connecting to      : %BS_HOST%:%BS_PORT%
 echo =========================================================================
 
-start "Worker-%W_ID%" java -cp bin worker.WorkerMain %W_ID% localhost %W_PORT% %BS_HOST% %BS_PORT%
+start "Worker-%W_ID%" java -jar "%~dp0..\target\worker-node.jar" %W_ID% localhost %W_RMI% %BS_HOST% %BS_PORT% %W_GRPC%
 
 echo Worker-%W_ID% started in a new terminal window.
