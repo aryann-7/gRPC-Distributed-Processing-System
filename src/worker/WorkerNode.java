@@ -10,6 +10,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 import worker.computation.JobRunner;
@@ -24,7 +25,7 @@ public class WorkerNode implements WorkerService {
         private final String host;
         private final int port;
         private volatile int coordinatorId = -1;
-        private final AtomicInteger currentTerm = new AtomicInteger(1);
+        private final AtomicInteger currentTerm = new AtomicInteger(0);
         private final AtomicInteger jac = new AtomicInteger(0);
         private volatile boolean isCoordinator = false;
         private final ElectionManager electionManager = new ElectionManager();
@@ -38,6 +39,12 @@ public class WorkerNode implements WorkerService {
         private final TaskExecutionEngine executionEngine;
         private final AtomicBoolean stopped = new AtomicBoolean();
         private final String sessionId = java.util.UUID.randomUUID().toString();
+        private final java.util.concurrent.ScheduledExecutorService membershipScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "membership-scheduler");
+                t.setDaemon(true);
+                return t;
+        });
+        private java.util.concurrent.ScheduledFuture<?> coordinatorRefreshTask;
 
         public WorkerNode(
                         int workerId,
@@ -67,7 +74,11 @@ public class WorkerNode implements WorkerService {
                                 () -> common.grpc.WorkerIdentity.newBuilder()
                                         .setWorkerId(workerId)
                                         .setSessionId(sessionId)
-                                        .build()
+                                        .build(),
+                                this::receiveElectionMessage,
+                                this::receiveElectionReply,
+                                new ConcurrentHashMap<>(),
+                                this::refreshNeighboursFromBootstrap
                         );
                         startingServer.start();
                 } catch (Exception e) {
@@ -120,49 +131,81 @@ public class WorkerNode implements WorkerService {
 
         @Override
         public JobResult executeJob(JobTask task) {
+                return executeJob(task, null);
+        }
 
+        public JobResult executeJob(JobTask task, java.util.function.Consumer<common.grpc.TaskProgressUpdate> progressConsumer) {
                 if (task == null) {
-
                         JobResult error = new JobResult();
-
                         error.setSuccess(false);
-                        error.setErrorMessage(
-                                        "Received null JobTask");
-
+                        error.setErrorMessage("Received null JobTask");
                         return error;
                 }
 
+                if (executionEngine != null) {
+                        try {
+                                var builder = common.grpc.TaskDispatchRequest.newBuilder()
+                                                .setJobId(task.getJobId() != null ? task.getJobId() : "")
+                                                .setTaskId(task.getTaskId() != null ? task.getTaskId() : "")
+                                                .setJobType(task.getJobType() != null
+                                                                ? common.grpc.JobTypeProto.valueOf(task.getJobType().name())
+                                                                : common.grpc.JobTypeProto.JOB_TYPE_UNSPECIFIED)
+                                                .setRangeStart(task.getRangeStart())
+                                                .setRangeEnd(task.getRangeEnd());
+                                if (task.getDataChunk() != null) {
+                                        builder.addAllDataChunk(task.getDataChunk());
+                                }
+
+                                worker.computation.ProgressListener listener = progressConsumer != null
+                                                ? progressConsumer::accept
+                                                : null;
+
+                                var future = executionEngine.submitTask(builder.build(), listener);
+                                common.grpc.TaskResultResponse response = future.get();
+
+                                return new JobResult(
+                                                response.getJobId(),
+                                                response.getTaskId(),
+                                                response.getSuccess(),
+                                                response.getResultValue(),
+                                                response.getErrorMessage(),
+                                                response.getExecutionTimeMs()
+                                );
+                        } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                JobResult error = new JobResult();
+                                error.setJobId(task.getJobId());
+                                error.setTaskId(task.getTaskId());
+                                error.setSuccess(false);
+                                error.setErrorMessage("Task interrupted: " + e.getMessage());
+                                return error;
+                        } catch (Exception e) {
+                                JobResult error = new JobResult();
+                                error.setJobId(task.getJobId());
+                                error.setTaskId(task.getTaskId());
+                                error.setSuccess(false);
+                                error.setErrorMessage("Execution error: " + e.getMessage());
+                                return error;
+                        }
+                }
+
                 try {
-
-                        var future = computationThreadPool.submit(
-                                        new JobRunner(task));
-
+                        var future = computationThreadPool.submit(new JobRunner(task));
                         return future.get();
-
                 } catch (InterruptedException e) {
-
                         Thread.currentThread().interrupt();
-
                         JobResult error = new JobResult();
-
                         error.setJobId(task.getJobId());
                         error.setTaskId(task.getTaskId());
                         error.setSuccess(false);
-                        error.setErrorMessage(
-                                        "Task interrupted: " + e.getMessage());
-
+                        error.setErrorMessage("Task interrupted: " + e.getMessage());
                         return error;
-
                 } catch (Exception e) {
-
                         JobResult error = new JobResult();
-
                         error.setJobId(task.getJobId());
                         error.setTaskId(task.getTaskId());
                         error.setSuccess(false);
-                        error.setErrorMessage(
-                                        "Execution error: " + e.getMessage());
-
+                        error.setErrorMessage("Execution error: " + e.getMessage());
                         return error;
                 }
         }
@@ -216,6 +259,8 @@ public class WorkerNode implements WorkerService {
                                 message.getMessageId(),
                                 children);
 
+                refreshNeighboursFromBootstrap();
+
                 for (Map.Entry<Integer, WorkerService> entry : neighbours.entrySet()) {
 
                         children.add(entry.getKey());
@@ -234,6 +279,10 @@ public class WorkerNode implements WorkerService {
 
                 if (message == null) {
                         return;
+                }
+
+                if (message.getTerm() > currentTerm.get()) {
+                        currentTerm.set(message.getTerm());
                 }
 
                 if (message.getMessageId() == null
@@ -517,6 +566,10 @@ public class WorkerNode implements WorkerService {
         private void receiveCoordinatorMessage(
                         ElectionMessage message) {
 
+                if (message != null && message.getTerm() > currentTerm.get()) {
+                        currentTerm.set(message.getTerm());
+                }
+
                 coordinatorId = message.getCandidateId();
 
                 isCoordinator = (workerId == coordinatorId);
@@ -583,6 +636,7 @@ public class WorkerNode implements WorkerService {
 
         private volatile String bootstrapHost = "localhost";
         private volatile int bootstrapPort = 50050;
+        private volatile String registryEpoch = "";
 
         public void connectToBootstrap(
                         String bootstrapHost,
@@ -605,7 +659,8 @@ public class WorkerNode implements WorkerService {
                                 .build();
 
                         var regResponse = grpcClient.registerWorker(descriptor);
-                        var neighboursList = grpcClient.getInitialNeighbours(descriptor.getIdentity(), regResponse.getRegistryEpoch());
+                        this.registryEpoch = regResponse.getRegistryEpoch();
+                        var neighboursList = grpcClient.getInitialNeighbours(descriptor.getIdentity(), this.registryEpoch);
 
                         for (common.grpc.WorkerDescriptor nDesc : neighboursList) {
                                 int nId = nDesc.getIdentity().getWorkerId();
@@ -614,10 +669,45 @@ public class WorkerNode implements WorkerService {
                                 addNeighbourFromEndpoint(nId + "|" + nHost + "|" + nPort);
                         }
 
+                        // Discover if a coordinator is already active in Bootstrap
+                        try {
+                                var coordResp = grpcClient.getCoordinator();
+                                if (coordResp != null && coordResp.hasCoordinator()) {
+                                        this.coordinatorId = coordResp.getCoordinator().getCoordinator().getIdentity().getWorkerId();
+                                        this.currentTerm.set(coordResp.getCoordinator().getTerm());
+                                        System.out.println("Worker " + workerId + " discovered active Coordinator: Worker " + coordinatorId + " (Term " + currentTerm.get() + ")");
+                                }
+                        } catch (Exception ignored) {
+                        }
+
                         System.out.println("Worker " + workerId + " connected to Bootstrap via gRPC (port " + bootstrapPort + ").");
                         System.out.println("Neighbours: " + neighbours.keySet());
                 } catch (Exception grpcEx) {
                         System.err.println("Worker " + workerId + " failed to connect to Bootstrap via gRPC: " + grpcEx.getMessage());
+                }
+        }
+
+        public synchronized void refreshNeighboursFromBootstrap() {
+                try (worker.grpc.BootstrapGrpcClient grpcClient = new worker.grpc.BootstrapGrpcClient(bootstrapHost, bootstrapPort)) {
+                        var response = grpcClient.listWorkers();
+                        if (response != null && response.hasSnapshot()) {
+                                for (common.grpc.WorkerDescriptor desc : response.getSnapshot().getWorkersList()) {
+                                        int id = desc.getIdentity().getWorkerId();
+                                        if (id != workerId && !neighbours.containsKey(id)) {
+                                                String wHost = desc.getEndpoint().getHost();
+                                                int wPort = desc.getEndpoint().getPort();
+                                                addNeighbourFromEndpoint(id + "|" + wHost + "|" + wPort);
+                                        }
+                                }
+                        }
+                } catch (Exception e) {
+                        // Silent or warn on topology refresh failure
+                }
+
+                if (isCoordinator && coordinatorManager != null) {
+                        for (WorkerService worker : neighbours.values()) {
+                                coordinatorManager.addWorker(worker);
+                        }
                 }
         }
 
@@ -635,6 +725,9 @@ public class WorkerNode implements WorkerService {
                 }
 
                 neighbours.putIfAbsent(neighbourId, neighbour);
+                if (isCoordinator && coordinatorManager != null) {
+                        coordinatorManager.addWorker(neighbour);
+                }
         }
 
         private void addNeighbourFromEndpoint(
@@ -724,7 +817,8 @@ public class WorkerNode implements WorkerService {
                         // Add self as an active compute worker
                         coordinatorManager.addWorker(this);
 
-                        // Add direct neighbours
+                        // Refresh cluster members from bootstrap and register as active workers
+                        refreshNeighboursFromBootstrap();
                         for (WorkerService worker : neighbours.values()) {
                                 coordinatorManager.addWorker(worker);
                         }
@@ -734,6 +828,15 @@ public class WorkerNode implements WorkerService {
                         try {
                                 bsChannel = io.grpc.ManagedChannelBuilder.forAddress(bootstrapHost, bootstrapPort).usePlaintext().build();
                                 common.grpc.BootstrapServiceGrpc.BootstrapServiceBlockingStub bsStub = common.grpc.BootstrapServiceGrpc.newBlockingStub(bsChannel);
+                                // If epoch is not yet cached, fetch it from Bootstrap
+                                String epoch = registryEpoch;
+                                if (epoch == null || epoch.isEmpty()) {
+                                        epoch = bsStub.withDeadlineAfter(3, java.util.concurrent.TimeUnit.SECONDS)
+                                                .getCoordinator(common.grpc.GetCoordinatorRequest.getDefaultInstance())
+                                                .getRegistryEpoch();
+                                        this.registryEpoch = epoch;
+                                }
+
                                 bsStub.withDeadlineAfter(3, java.util.concurrent.TimeUnit.SECONDS).publishCoordinator(
                                         common.grpc.PublishCoordinatorRequest.newBuilder()
                                                 .setCoordinator(common.grpc.CoordinatorRecord.newBuilder()
@@ -749,6 +852,7 @@ public class WorkerNode implements WorkerService {
                                                                 .build())
                                                         .setTerm(currentTerm.get())
                                                         .build())
+                                                .setRegistryEpoch(epoch)
                                                 .build());
                                 System.out.println("Worker " + workerId + " published Coordinator identity to Bootstrap via gRPC.");
                         } catch (Exception e) {
@@ -763,6 +867,18 @@ public class WorkerNode implements WorkerService {
                                         "Worker " + workerId +
                                                         " is now coordinator.");
 
+                        if (coordinatorRefreshTask != null) {
+                                coordinatorRefreshTask.cancel(false);
+                        }
+                        coordinatorRefreshTask = membershipScheduler.scheduleWithFixedDelay(() -> {
+                                try {
+                                        if (isCoordinator && coordinatorManager != null) {
+                                                refreshNeighboursFromBootstrap();
+                                        }
+                                } catch (Exception ignored) {
+                                }
+                        }, 1500, 1500, TimeUnit.MILLISECONDS);
+
                 } catch (Exception e) {
 
                         System.err.println(
@@ -772,6 +888,11 @@ public class WorkerNode implements WorkerService {
         }
 
         public synchronized void stepDownToWorker() {
+
+                if (coordinatorRefreshTask != null) {
+                        coordinatorRefreshTask.cancel(false);
+                        coordinatorRefreshTask = null;
+                }
 
                 if (coordinatorManager != null) {
 
@@ -834,6 +955,10 @@ public class WorkerNode implements WorkerService {
                         Thread.currentThread().interrupt();
                 } finally {
                         computationThreadPool.shutdownNow();
+                        if (coordinatorRefreshTask != null) {
+                                coordinatorRefreshTask.cancel(false);
+                        }
+                        membershipScheduler.shutdownNow();
                         if (coordinatorManager != null) {
                                 coordinatorManager.close();
                         }

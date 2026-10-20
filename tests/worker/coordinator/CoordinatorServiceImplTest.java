@@ -180,12 +180,16 @@ public class CoordinatorServiceImplTest {
         assertEquals(99L, last.getResultValue());
         assertEquals(5, last.getUnitsCompleted());
         assertEquals(5, last.getTotalUnits());
+        assertEquals(1, last.getWorkersCount(), "Should contain at least 1 worker in breakdown");
+        assertEquals(5, last.getWorkers(0).getUnitsCompleted());
+        assertEquals(5, last.getWorkers(0).getTotalUnits());
 
         // Verify getJobStatus unary
         GetJobStatusRequest statusReq = GetJobStatusRequest.newBuilder().setJobId("job-success-1").build();
         JobProgress statusResp = blockingStub.getJobStatus(statusReq);
         assertEquals(JobStateProto.COMPLETED, statusResp.getState());
         assertEquals(99L, statusResp.getResultValue());
+        assertEquals(1, statusResp.getWorkersCount(), "Status response should also have worker breakdown");
     }
 
     @Test

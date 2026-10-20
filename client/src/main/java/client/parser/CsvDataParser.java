@@ -23,27 +23,60 @@ public class CsvDataParser {
             throw new IOException("File does not exist or is null");
         }
 
-        List<Long> numbers = new ArrayList<>();
-        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty() || line.startsWith("#")) {
-                    continue;
+        byte[] bytes = java.nio.file.Files.readAllBytes(file.toPath());
+        List<Long> numbers = new ArrayList<>(Math.max(16, bytes.length / 6));
+
+        long current = 0;
+        boolean inNumber = false;
+        boolean negative = false;
+        boolean inComment = false;
+
+        for (int i = 0; i < bytes.length; i++) {
+            byte b = bytes[i];
+
+            // Handle newline reset
+            if (b == '\n' || b == '\r') {
+                if (inNumber) {
+                    numbers.add(negative ? -current : current);
+                    current = 0;
+                    inNumber = false;
+                    negative = false;
                 }
-                String[] tokens = line.split("[,\\s]+");
-                for (String token : tokens) {
-                    token = token.trim();
-                    if (!token.isEmpty()) {
-                        try {
-                            numbers.add(Long.parseLong(token));
-                        } catch (NumberFormatException ignored) {
-                            // Skip non-numeric header tokens or invalid entries
-                        }
-                    }
+                inComment = false;
+                continue;
+            }
+
+            if (inComment) {
+                continue;
+            }
+
+            // Comment line
+            if (b == '#' && !inNumber) {
+                inComment = true;
+                continue;
+            }
+
+            // Digit parsing
+            if (b >= '0' && b <= '9') {
+                current = current * 10 + (b - '0');
+                inNumber = true;
+            } else if (b == '-' && !inNumber) {
+                negative = true;
+                inNumber = true;
+            } else {
+                if (inNumber) {
+                    numbers.add(negative ? -current : current);
+                    current = 0;
+                    inNumber = false;
+                    negative = false;
                 }
             }
         }
+
+        if (inNumber) {
+            numbers.add(negative ? -current : current);
+        }
+
         return numbers;
     }
 }

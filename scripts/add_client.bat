@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+set "JAVA_TOOL_OPTIONS="
 
 REM =========================================================================
 REM CS324 Add Dynamic Client GUI Script (Windows)
@@ -37,6 +38,7 @@ echo Assigned Client ID : #%CLIENT_ID%
 echo Connecting to      : %BS_HOST%:%BS_PORT%
 echo =========================================================================
 
-start "Client GUI #%CLIENT_ID%" java -jar "%~dp0..\client\target\distrilab-client.jar" %CLIENT_ID% %BS_HOST% %BS_PORT%
+set JVM_FLAGS=--add-opens java.base/jdk.internal.misc=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true
+start "Client GUI #%CLIENT_ID%" java %JVM_FLAGS% -jar "%~dp0..\client\target\distrilab-client.jar" %CLIENT_ID% %BS_HOST% %BS_PORT%
 
 echo Client GUI #%CLIENT_ID% started in a new window.

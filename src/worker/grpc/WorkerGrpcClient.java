@@ -81,6 +81,31 @@ public final class WorkerGrpcClient implements WorkerService, AutoCloseable {
                 result.getErrorMessage(), result.getExecutionTimeMs());
     }
 
+    public int getWorkerId() {
+        return descriptor.getIdentity().getWorkerId();
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o instanceof WorkerGrpcClient other) {
+            return getWorkerId() == other.getWorkerId();
+        }
+        return false;
+    }
+
+    @Override
+    public int hashCode() {
+        return Integer.hashCode(getWorkerId());
+    }
+
+    @Override
+    public String toString() {
+        return "WorkerGrpcClient(id=" + getWorkerId() + ", endpoint="
+                + descriptor.getEndpoint().getHost() + ":" + descriptor.getEndpoint().getPort() + ")";
+    }
+
     @Override
     public void close() { peer.close(); }
 }
+

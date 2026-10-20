@@ -22,11 +22,9 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
     private final int workerId;
     private final ProgressListener progressListener;
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
-    private final java.util.concurrent.atomic.AtomicLong lastProcessedUnits = new java.util.concurrent.atomic.AtomicLong(0);
+    private final java.util.concurrent.atomic.AtomicLong lastProcessedUnits = new java.util.concurrent.atomic.AtomicLong(
+            0);
     private final java.util.concurrent.atomic.AtomicLong lastTotalUnits = new java.util.concurrent.atomic.AtomicLong(0);
-
-    // Number of evaluation steps between emitting progress updates over the network
-    private static final int PROGRESS_BATCH_SIZE = 500;
 
     public GranularJobRunner(TaskDispatchRequest request, int workerId, ProgressListener progressListener) {
         this.request = request;
@@ -90,11 +88,16 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
         int totalUnits = data.size();
 
         if (totalUnits == 0) {
-            return buildErrorResponse(request.getJobId(), request.getTaskId(), "Data chunk is empty for MAX task", startTime);
+            return buildErrorResponse(request.getJobId(), request.getTaskId(), "Data chunk is empty for MAX task",
+                    startTime);
         }
 
         long max = Long.MIN_VALUE;
         long lastEmitUnits = 0;
+        long emitInterval = Math.max(50L, Math.min(10000L, (long) totalUnits / 200));
+        long lastEmitTime = System.currentTimeMillis();
+
+        emitProgress(0, totalUnits, "PROCESSING");
 
         for (int i = 0; i < totalUnits; i++) {
             if (cancelled.get() || Thread.currentThread().isInterrupted()) {
@@ -107,10 +110,12 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
             }
 
             int processed = i + 1;
-            // Emit progress at regular batches or on final item
-            if (processed - lastEmitUnits >= PROGRESS_BATCH_SIZE || processed == totalUnits) {
+            long now = System.currentTimeMillis();
+            if (processed - lastEmitUnits >= emitInterval || (now - lastEmitTime >= 100 && processed > lastEmitUnits)
+                    || processed == totalUnits) {
                 emitProgress(processed, totalUnits, "PROCESSING");
                 lastEmitUnits = processed;
+                lastEmitTime = now;
             }
         }
 
@@ -148,8 +153,23 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
         long sum = 0;
         long processed = 0;
         long lastEmitUnits = 0;
+        long emitInterval = Math.max(50L, Math.min(10000L, totalUnits / 200));
+        long lastEmitTime = System.currentTimeMillis();
 
-        for (long curr = start; curr <= end; curr++) {
+        emitProgress(0, totalUnits, "PROCESSING");
+
+        // Fast-path handling: 2 is the only even prime
+        if (start <= 2 && 2 <= end) {
+            sum += 2;
+        }
+
+        // Adjust loop start to first odd number >= Math.max(3, start)
+        long firstOdd = Math.max(3, start);
+        if (firstOdd % 2 == 0) {
+            firstOdd++;
+        }
+
+        for (long curr = firstOdd; curr <= end; curr += 2) {
             if (cancelled.get() || Thread.currentThread().isInterrupted()) {
                 throw new InterruptedException("PRIMESUM computation was cancelled");
             }
@@ -158,10 +178,14 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
                 sum += curr;
             }
 
-            processed++;
-            if (processed - lastEmitUnits >= PROGRESS_BATCH_SIZE || processed == totalUnits) {
-                emitProgress(processed, totalUnits, "PROCESSING");
+            // Estimate/track progress
+            processed = (curr - start) + 1;
+            long now = System.currentTimeMillis();
+            if (processed - lastEmitUnits >= emitInterval || (now - lastEmitTime >= 100 && processed > lastEmitUnits)
+                    || curr >= end - 1) {
+                emitProgress(Math.min(processed, totalUnits), totalUnits, "PROCESSING");
                 lastEmitUnits = processed;
+                lastEmitTime = now;
             }
         }
 
@@ -186,11 +210,16 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
         int totalUnits = data.size();
 
         if (totalUnits == 0) {
-            return buildErrorResponse(request.getJobId(), request.getTaskId(), "Data chunk is empty for PRIMECOUNT task", startTime);
+            return buildErrorResponse(request.getJobId(), request.getTaskId(),
+                    "Data chunk is empty for PRIMECOUNT task", startTime);
         }
 
         long count = 0;
         long lastEmitUnits = 0;
+        long emitInterval = Math.max(50L, Math.min(10000L, (long) totalUnits / 200));
+        long lastEmitTime = System.currentTimeMillis();
+
+        emitProgress(0, totalUnits, "PROCESSING");
 
         for (int i = 0; i < totalUnits; i++) {
             if (cancelled.get() || Thread.currentThread().isInterrupted()) {
@@ -198,14 +227,20 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
             }
 
             Long num = data.get(i);
-            if (num != null && isPrime(num)) {
-                count++;
+            if (num != null) {
+                long val = num;
+                if (val == 2 || (val > 2 && (val & 1) != 0 && isPrime(val))) {
+                    count++;
+                }
             }
 
             int processed = i + 1;
-            if (processed - lastEmitUnits >= PROGRESS_BATCH_SIZE || processed == totalUnits) {
+            long now = System.currentTimeMillis();
+            if (processed - lastEmitUnits >= emitInterval || (now - lastEmitTime >= 100 && processed > lastEmitUnits)
+                    || processed == totalUnits) {
                 emitProgress(processed, totalUnits, "PROCESSING");
                 lastEmitUnits = processed;
+                lastEmitTime = now;
             }
         }
 
@@ -231,7 +266,8 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
         }
 
         double percentage = ((double) processed / total) * 100.0;
-        if (percentage > 100.0) percentage = 100.0;
+        if (percentage > 100.0)
+            percentage = 100.0;
 
         TaskProgressUpdate update = TaskProgressUpdate.newBuilder()
                 .setJobId(request.getJobId())
@@ -262,15 +298,39 @@ public class GranularJobRunner implements Callable<TaskResultResponse> {
                 .build();
     }
 
+    private static final int SIEVE_LIMIT = 100_000;
+    private static final boolean[] IS_PRIME = new boolean[SIEVE_LIMIT + 1];
+
+    static {
+        java.util.Arrays.fill(IS_PRIME, true);
+        IS_PRIME[0] = false;
+        if (SIEVE_LIMIT >= 1)
+            IS_PRIME[1] = false;
+        for (int p = 2; p * p <= SIEVE_LIMIT; p++) {
+            if (IS_PRIME[p]) {
+                for (int i = p * p; i <= SIEVE_LIMIT; i += p) {
+                    IS_PRIME[i] = false;
+                }
+            }
+        }
+    }
+
     /**
-     * Efficient 6k +/- 1 prime test ported from A1
+     * O(1) lookup for numbers <= 100,000, fallback to 6k +/- 1 for larger numbers.
      */
     private boolean isPrime(long n) {
-        if (n <= 1) return false;
-        if (n <= 3) return true;
-        if (n % 2 == 0 || n % 3 == 0) return false;
+        if (n <= 1)
+            return false;
+        if (n <= SIEVE_LIMIT) {
+            return IS_PRIME[(int) n];
+        }
+        if (n <= 3)
+            return true;
+        if (n % 2 == 0 || n % 3 == 0)
+            return false;
         for (long i = 5; i * i <= n; i += 6) {
-            if (n % i == 0 || n % (i + 2) == 0) return false;
+            if (n % i == 0 || n % (i + 2) == 0)
+                return false;
         }
         return true;
     }

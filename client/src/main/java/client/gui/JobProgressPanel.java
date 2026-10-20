@@ -27,8 +27,6 @@ public class JobProgressPanel extends JPanel {
         super(new BorderLayout());
         setBorder(BorderFactory.createTitledBorder("Jobs (click a row for the worker breakdown)"));
 
-        table.getColumnModel().getColumn(JobTableModel.COL_PROGRESS)
-                .setCellRenderer(new ProgressBarRenderer());
         table.setRowHeight(24);
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         table.addMouseListener(new MouseAdapter() {

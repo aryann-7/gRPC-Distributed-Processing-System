@@ -87,7 +87,14 @@ public class JobRunner implements Callable<JobResult> {
         }
 
         long sum = 0;
-        for (long i = start; i <= end; i++) {
+        if (start <= 2 && 2 <= end) {
+            sum += 2;
+        }
+        long firstOdd = Math.max(3, start);
+        if (firstOdd % 2 == 0) {
+            firstOdd++;
+        }
+        for (long i = firstOdd; i <= end; i += 2) {
             if (isPrime(i)) {
                 sum += i;
             }
@@ -109,8 +116,11 @@ public class JobRunner implements Callable<JobResult> {
 
         long count = 0;
         for (Long num : task.getDataChunk()) {
-            if (num != null && isPrime(num)) {
-                count++;
+            if (num != null) {
+                long val = num;
+                if (val == 2 || (val > 2 && (val & 1) != 0 && isPrime(val))) {
+                    count++;
+                }
             }
         }
 
@@ -119,10 +129,29 @@ public class JobRunner implements Callable<JobResult> {
         return result;
     }
 
-    // Helper to verify if a number is prime.
+    private static final int SIEVE_LIMIT = 100_000;
+    private static final boolean[] IS_PRIME = new boolean[SIEVE_LIMIT + 1];
+
+    static {
+        java.util.Arrays.fill(IS_PRIME, true);
+        IS_PRIME[0] = false;
+        if (SIEVE_LIMIT >= 1) IS_PRIME[1] = false;
+        for (int p = 2; p * p <= SIEVE_LIMIT; p++) {
+            if (IS_PRIME[p]) {
+                for (int i = p * p; i <= SIEVE_LIMIT; i += p) {
+                    IS_PRIME[i] = false;
+                }
+            }
+        }
+    }
+
+    // Helper to verify if a number is prime (O(1) table lookup with 6k +/- 1 fallback).
     private boolean isPrime(long n) {
         if (n <= 1) {
             return false;
+        }
+        if (n <= SIEVE_LIMIT) {
+            return IS_PRIME[(int) n];
         }
         if (n <= 3) {
             return true;

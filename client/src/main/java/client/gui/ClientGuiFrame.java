@@ -23,8 +23,12 @@ import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
@@ -76,9 +80,19 @@ public class ClientGuiFrame extends JFrame {
     private JButton browseCsvButton;
     private JTextField rangeStartField;
     private JTextField rangeEndField;
+    private JLabel rangeLabel;
     private JTextArea logArea;
     private JLabel statusLabel;
     private final JobProgressPanel jobsPanel = new JobProgressPanel();
+
+    private final Set<String> knownClients = ConcurrentHashMap.newKeySet();
+    private final Set<Integer> knownWorkers = ConcurrentHashMap.newKeySet();
+    private final ScheduledExecutorService presenceExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "client-presence-watcher");
+        t.setDaemon(true);
+        return t;
+    });
+    private io.grpc.ManagedChannel bsWatcherChannel;
 
     public ClientGuiFrame(String clientId, String defaultHost, int defaultPort,
                           CoordinatorClientFactory clientFactory) {
@@ -131,6 +145,7 @@ public class ClientGuiFrame extends JFrame {
 
         setContentPane(main);
         updateInputMode();
+        initMembershipAndPresence();
     }
 
     private JPanel buildConnectionPanel() {
@@ -180,9 +195,10 @@ public class ClientGuiFrame extends JFrame {
         c.gridx = 1; c.weightx = 0.8;
         form.add(browseCsvButton, c);
 
-        // Row 3: range (PRIMESUM)
+        // Row 3: range (PRIMESUM / PRIMECOUNT)
         c.gridx = 0; c.gridy = 3; c.weightx = 0.2;
-        form.add(new JLabel("Range (PRIMESUM):"), c);
+        rangeLabel = new JLabel("Range (PRIMESUM / PRIMECOUNT):");
+        form.add(rangeLabel, c);
         JPanel range = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         range.add(new JLabel("Start:"));
         rangeStartField = new JTextField("1", 10);
@@ -202,13 +218,21 @@ public class ClientGuiFrame extends JFrame {
         return form;
     }
 
-    /** PRIMESUM takes a range; the other jobs take a number list. */
+    /** 
+     * MAX uses number list / CSV.
+     * PRIMESUM uses range.
+     * PRIMECOUNT allows both: list/CSV or range filter!
+     */
     private void updateInputMode() {
-        boolean range = ((JobKind) jobKindBox.getSelectedItem()).isRangeBased();
-        rangeStartField.setEnabled(range);
-        rangeEndField.setEnabled(range);
-        numbersArea.setEnabled(!range);
-        browseCsvButton.setEnabled(!range);
+        JobKind kind = (JobKind) jobKindBox.getSelectedItem();
+        boolean isPrimesum = (kind == JobKind.PRIMESUM);
+        boolean isPrimecount = (kind == JobKind.PRIMECOUNT);
+        boolean isMax = (kind == JobKind.MAX);
+
+        rangeStartField.setEnabled(isPrimesum || isPrimecount);
+        rangeEndField.setEnabled(isPrimesum || isPrimecount);
+        numbersArea.setEnabled(isMax || isPrimecount);
+        browseCsvButton.setEnabled(isMax || isPrimecount);
     }
 
     // ------------------------------------------------------------------
@@ -313,9 +337,155 @@ public class ClientGuiFrame extends JFrame {
     }
 
     private synchronized void shutdown() {
+        presenceExecutor.shutdownNow();
+        if (bsWatcherChannel != null) {
+            bsWatcherChannel.shutdownNow();
+        }
         backgroundPool.shutdownNow();
         if (coordinatorClient != null) {
             coordinatorClient.close();
+        }
+    }
+
+    private static File getClientRegistryFile() {
+        for (File candidate : new File[] {
+                new File("scripts/clients_registry.txt"),
+                new File("../scripts/clients_registry.txt"),
+                new File("clients_registry.txt")
+        }) {
+            if (candidate.getParentFile() != null && candidate.getParentFile().exists()) {
+                return candidate;
+            }
+        }
+        return new File("scripts/clients_registry.txt");
+    }
+
+    private void initMembershipAndPresence() {
+        logMessage("[CLIENT] Client #" + clientId + " joined the cluster.");
+
+        startClientPresenceWatcher();
+        startClusterMembershipWatcher();
+
+        backgroundPool.submit(() -> {
+            try {
+                CoordinatorClient client = currentClient();
+                String found = client.checkConnection();
+                logMessage("[COORDINATOR] Connected: " + found);
+                setStatus("Ready (Coordinator reachable)");
+            } catch (Exception e) {
+                logMessage("[COORDINATOR] Discovery: " + e.getMessage());
+            }
+        });
+    }
+
+    private void startClientPresenceWatcher() {
+        File registryFile = getClientRegistryFile();
+        try {
+            if (registryFile.getParentFile() != null && !registryFile.getParentFile().exists()) {
+                registryFile.getParentFile().mkdirs();
+            }
+            if (registryFile.exists()) {
+                List<String> lines = java.nio.file.Files.readAllLines(registryFile.toPath());
+                for (String line : lines) {
+                    String trimmed = line.trim();
+                    if (!trimmed.isEmpty()) {
+                        knownClients.add(trimmed);
+                    }
+                }
+            }
+            if (!knownClients.contains(clientId)) {
+                java.nio.file.Files.writeString(
+                        registryFile.toPath(),
+                        clientId + System.lineSeparator(),
+                        java.nio.file.StandardOpenOption.CREATE,
+                        java.nio.file.StandardOpenOption.APPEND
+                );
+            }
+            knownClients.add(clientId);
+        } catch (Exception ignored) {
+        }
+
+        presenceExecutor.scheduleWithFixedDelay(() -> {
+            try {
+                if (registryFile.exists()) {
+                    List<String> lines = java.nio.file.Files.readAllLines(registryFile.toPath());
+                    for (String line : lines) {
+                        String trimmed = line.trim();
+                        if (!trimmed.isEmpty() && knownClients.add(trimmed)) {
+                            logMessage("[MEMBERSHIP] Client #" + trimmed + " has joined the cluster.");
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+    }
+
+    private synchronized void startClusterMembershipWatcher() {
+        if (bsWatcherChannel != null && !bsWatcherChannel.isShutdown()) {
+            try {
+                bsWatcherChannel.shutdownNow();
+            } catch (Exception ignored) {
+            }
+        }
+
+        String host = defaultHost;
+        int port = defaultPort;
+
+        try {
+            bsWatcherChannel = io.grpc.ManagedChannelBuilder.forAddress(host, port)
+                    .usePlaintext()
+                    .build();
+
+            common.grpc.BootstrapServiceGrpc.BootstrapServiceStub stub =
+                    common.grpc.BootstrapServiceGrpc.newStub(bsWatcherChannel);
+
+            stub.watchMembership(
+                    common.grpc.WatchMembershipRequest.getDefaultInstance(),
+                    new io.grpc.stub.StreamObserver<common.grpc.MembershipUpdate>() {
+                        @Override
+                        public void onNext(common.grpc.MembershipUpdate update) {
+                            if (update.hasSnapshot()) {
+                                var snapshot = update.getSnapshot();
+                                List<Integer> currentWorkerIds = new java.util.ArrayList<>();
+                                for (common.grpc.WorkerDescriptor d : snapshot.getWorkersList()) {
+                                    int wid = d.getIdentity().getWorkerId();
+                                    knownWorkers.add(wid);
+                                    currentWorkerIds.add(wid);
+                                }
+                                logMessage("[CLUSTER] Connected to Bootstrap (" + host + ":" + port
+                                        + "). Active workers: " + currentWorkerIds);
+                            } else if (update.hasChange()) {
+                                var change = update.getChange();
+                                int wid = change.getWorker().getIdentity().getWorkerId();
+                                if (change.getKind() == common.grpc.MembershipChange.Kind.JOINED) {
+                                    if (knownWorkers.add(wid)) {
+                                        String endpoint = change.getWorker().getEndpoint().getHost() + ":"
+                                                + change.getWorker().getEndpoint().getPort();
+                                        logMessage("[MEMBERSHIP] Worker " + wid + " has joined the cluster ("
+                                                + endpoint + ").");
+                                    }
+                                } else if (change.getKind() == common.grpc.MembershipChange.Kind.LEFT
+                                        || change.getKind() == common.grpc.MembershipChange.Kind.EXPIRED) {
+                                    knownWorkers.remove(wid);
+                                    logMessage("[MEMBERSHIP] Worker " + wid + " has left the cluster.");
+                                }
+                            }
+                        }
+
+                        @Override
+                        public void onError(Throwable t) {
+                            presenceExecutor.schedule(() -> startClusterMembershipWatcher(), 3, TimeUnit.SECONDS);
+                        }
+
+                        @Override
+                        public void onCompleted() {
+                            presenceExecutor.schedule(() -> startClusterMembershipWatcher(), 3, TimeUnit.SECONDS);
+                        }
+                    }
+            );
+        } catch (Exception e) {
+            presenceExecutor.schedule(() -> startClusterMembershipWatcher(), 3, TimeUnit.SECONDS);
         }
     }
 

@@ -85,9 +85,18 @@ public class CoordinatorManager implements CoordinatorService, AutoCloseable {
     private final java.util.concurrent.ExecutorService dispatchPool = java.util.concurrent.Executors.newCachedThreadPool();
 
     public void addWorker(common.interfaces.WorkerService worker) {
-        if (worker != null && !activeWorkers.contains(worker)) {
-            activeWorkers.add(worker);
+        if (worker == null) {
+            return;
         }
+        int newId = getWorkerId(worker, -1);
+        for (common.interfaces.WorkerService existing : activeWorkers) {
+            if (getWorkerId(existing, -2) == newId) {
+                return;
+            }
+        }
+        activeWorkers.add(worker);
+        System.out.println("Coordinator (term " + currentTerm + ") added Worker " + newId
+                + " to active worker pool. Total active workers: " + activeWorkers.size());
     }
 
     public void removeWorker(common.interfaces.WorkerService worker) {
@@ -132,6 +141,9 @@ public class CoordinatorManager implements CoordinatorService, AutoCloseable {
         }
 
         int numWorkers = activeWorkers.size();
+        System.out.println("Coordinator: Partitioning job " + request.getJobId() + " (" + request.getJobType()
+                + ") across " + numWorkers + " active workers: "
+                + activeWorkers.stream().map(w -> getWorkerId(w, -1)).toList());
         java.util.List<common.models.JobTask> tasks = new java.util.ArrayList<>();
 
         switch (request.getJobType()) {
@@ -214,6 +226,12 @@ public class CoordinatorManager implements CoordinatorService, AutoCloseable {
                     JobResult res;
                     if (worker instanceof worker.grpc.WorkerGrpcClient client) {
                         res = client.executeJob(currentTask, update -> progress.accept(client.descriptor().getIdentity(), update));
+                    } else if (worker instanceof worker.WorkerNode node) {
+                        common.grpc.WorkerIdentity wid = common.grpc.WorkerIdentity.newBuilder()
+                                .setWorkerId(workerId)
+                                .setSessionId("worker-" + workerId)
+                                .build();
+                        res = node.executeJob(currentTask, update -> progress.accept(wid, update));
                     } else {
                         res = worker.executeJob(currentTask);
                     }
@@ -221,6 +239,36 @@ public class CoordinatorManager implements CoordinatorService, AutoCloseable {
                     long rpcDuration = System.currentTimeMillis() - rpcStart;
 
                     if (res != null && res.isSuccess()) {
+                        long taskUnits;
+                        if (currentTask.getJobType() == common.models.JobType.PRIMESUM) {
+                            taskUnits = Math.abs(currentTask.getRangeEnd() - currentTask.getRangeStart()) + 1;
+                        } else {
+                            taskUnits = currentTask.getDataChunk() != null ? currentTask.getDataChunk().size() : 0;
+                        }
+
+                        common.grpc.WorkerIdentity wid;
+                        if (worker instanceof worker.grpc.WorkerGrpcClient client) {
+                            wid = client.descriptor().getIdentity();
+                        } else {
+                            wid = common.grpc.WorkerIdentity.newBuilder()
+                                    .setWorkerId(workerId)
+                                    .setSessionId("worker-" + workerId)
+                                    .build();
+                        }
+                        common.grpc.TaskProgressUpdate compUpdate = common.grpc.TaskProgressUpdate.newBuilder()
+                                .setJobId(currentTask.getJobId())
+                                .setTaskId(currentTask.getTaskId())
+                                .setWorkerId(workerId)
+                                .setProgressPercentage(100.0)
+                                .setUnitsCompleted(taskUnits)
+                                .setTotalUnits(taskUnits)
+                                .setStatusMessage("COMPLETED")
+                                .build();
+                        try {
+                            progress.accept(wid, compUpdate);
+                        } catch (Exception ignored) {
+                        }
+
                         failureDetector.recordHeartbeat(workerId, rpcDuration);
                         try {
                             taskLedger.completeTask(currentTask.getTaskId(), workerId, res.getResultValue());
