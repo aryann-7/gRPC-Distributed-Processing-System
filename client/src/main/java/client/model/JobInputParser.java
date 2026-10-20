@@ -69,11 +69,38 @@ public final class JobInputParser {
     /** Builds a validated JobSpec from the form fields. */
     public static JobSpec build(JobKind kind, String numbersText, String startText, String endText) {
         String jobId = newJobId();
-        if (kind.isRangeBased()) {
+        if (kind == JobKind.PRIMESUM) {
             long start = parseLong(startText, "Start");
             long end = parseLong(endText, "End");
             return JobSpec.forRange(jobId, start, end);
         }
+
+        if (kind == JobKind.PRIMECOUNT) {
+            String trimmedNum = (numbersText == null) ? "" : numbersText.trim();
+            String trimmedStart = (startText == null) ? "" : startText.trim();
+            String trimmedEnd = (endText == null) ? "" : endText.trim();
+
+            // If range is specified (and numbers are empty or user provided range), generate range
+            if (trimmedNum.isEmpty() && !trimmedStart.isEmpty() && !trimmedEnd.isEmpty()) {
+                long start = parseLong(startText, "Start");
+                long end = parseLong(endText, "End");
+                if (start > end) {
+                    long temp = start;
+                    start = end;
+                    end = temp;
+                }
+                long count = (end - start) + 1;
+                if (count > 5000000) {
+                    throw new IllegalArgumentException("Range size cannot exceed 5,000,000 numbers.");
+                }
+                List<Long> rangeNumbers = new ArrayList<>((int) count);
+                for (long i = start; i <= end; i++) {
+                    rangeNumbers.add(i);
+                }
+                return JobSpec.forNumbers(jobId, JobKind.PRIMECOUNT, rangeNumbers);
+            }
+        }
+
         return JobSpec.forNumbers(jobId, kind, parseNumbers(numbersText));
     }
 }

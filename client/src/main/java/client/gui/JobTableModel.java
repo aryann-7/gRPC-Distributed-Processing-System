@@ -11,8 +11,7 @@ import javax.swing.table.AbstractTableModel;
  */
 public class JobTableModel extends AbstractTableModel {
 
-    public static final int COL_PROGRESS = 2;
-    private static final String[] COLUMNS = {"Job ID", "Type", "Progress", "Status", "Result"};
+    private static final String[] COLUMNS = {"Job ID", "Type", "Status", "Result"};
 
     private final List<JobProgressTracker> jobs = new ArrayList<>();
 
@@ -38,7 +37,7 @@ public class JobTableModel extends AbstractTableModel {
 
     @Override
     public Class<?> getColumnClass(int col) {
-        return col == COL_PROGRESS ? Double.class : String.class;
+        return String.class;
     }
 
     @Override
@@ -47,12 +46,11 @@ public class JobTableModel extends AbstractTableModel {
         switch (col) {
             case 0: return job.getJobId();
             case 1: return job.getJobType();
-            case 2: return job.overallPercent();
-            case 3:
+            case 2:
                 return job.getAttempt() > 1
                         ? job.getState() + " (attempt " + job.getAttempt() + ")"
                         : job.getState().toString();
-            case 4:
+            case 3:
                 if (job.getState() == JobProgressTracker.State.FAILED) {
                     return job.getErrorMessage();
                 }
