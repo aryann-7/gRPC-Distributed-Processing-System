@@ -65,6 +65,28 @@ public final class BootstrapGrpcClient implements AutoCloseable {
                 .getCoordinator(common.grpc.GetCoordinatorRequest.getDefaultInstance());
     }
 
+    public common.grpc.ClearCoordinatorResponse clearCoordinator(int coordinatorId, int term, String registryEpoch) {
+        return stub.withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .clearCoordinator(common.grpc.ClearCoordinatorRequest.newBuilder()
+                        .setCoordinator(common.grpc.WorkerIdentity.newBuilder()
+                                .setWorkerId(coordinatorId)
+                                .setSessionId("worker-" + coordinatorId)
+                                .build())
+                        .setTerm(term)
+                        .setRegistryEpoch(registryEpoch != null ? registryEpoch : "")
+                        .build());
+    }
+
+    public common.grpc.ClearCoordinatorResponse clearCoordinator(common.grpc.WorkerIdentity identity, int term, String registryEpoch) {
+        return stub.withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS)
+                .clearCoordinator(common.grpc.ClearCoordinatorRequest.newBuilder()
+                        .setCoordinator(identity)
+                        .setTerm(term)
+                        .setRegistryEpoch(registryEpoch != null ? registryEpoch : "")
+                        .build());
+    }
+
+
     @Override
     public void close() {
         channel.shutdown();

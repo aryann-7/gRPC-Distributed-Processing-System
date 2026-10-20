@@ -23,6 +23,7 @@ public class JobProgressTracker {
     private volatile Long result;
     private volatile String errorMessage;
     private volatile int attempt = 1;
+    private volatile double lastCapturedPercent = 0.0;
 
     public JobProgressTracker(String jobId, String jobType) {
         this.jobId = jobId;
@@ -31,14 +32,19 @@ public class JobProgressTracker {
 
     /** Stores the coordinator's newest snapshot (it replaces the old one). */
     public void apply(ProgressSnapshot snapshot) {
-        this.latest = snapshot;
-        if (!isFinished()) {
-            state = snapshot.queued() ? State.QUEUED : State.RUNNING;
+        if (isFinished()) {
+            return;
         }
+        this.latest = snapshot;
+        if (snapshot.totalUnits() > 0) {
+            this.lastCapturedPercent = Math.min(100.0, (snapshot.unitsCompleted() * 100.0) / snapshot.totalUnits());
+        }
+        state = snapshot.queued() ? State.QUEUED : State.RUNNING;
     }
 
     public void complete(long resultValue) {
         this.result = resultValue;
+        this.lastCapturedPercent = 100.0;
         this.state = State.COMPLETED;
     }
 
@@ -56,6 +62,7 @@ public class JobProgressTracker {
         this.latest = null;
         this.attempt = attemptNo;
         this.state = State.RETRYING;
+        this.lastCapturedPercent = 0.0;
     }
 
     /**
@@ -63,16 +70,22 @@ public class JobProgressTracker {
      * by the coordinator. The total includes work not yet handed to any
      * worker, so the bar never jumps to 100% early. Not an average of the
      * workers' percentages, which would ignore that chunks differ in size.
+     * When cancelled or failed, progress stops and freezes at the exact value achieved.
      */
     public double overallPercent() {
         if (state == State.COMPLETED) {
             return 100.0;
         }
+        if (state == State.FAILED) {
+            return lastCapturedPercent;
+        }
         ProgressSnapshot s = latest;
         if (s == null || s.totalUnits() <= 0) {
-            return 0.0;
+            return lastCapturedPercent;
         }
-        return Math.min(100.0, (s.unitsCompleted() * 100.0) / s.totalUnits());
+        double pct = Math.min(100.0, (s.unitsCompleted() * 100.0) / s.totalUnits());
+        lastCapturedPercent = pct;
+        return pct;
     }
 
     /** Job-wide units done, 0 before the first snapshot. */

@@ -39,12 +39,15 @@ public class WorkerNode implements WorkerService {
         private final TaskExecutionEngine executionEngine;
         private final AtomicBoolean stopped = new AtomicBoolean();
         private final String sessionId = java.util.UUID.randomUUID().toString();
-        private final java.util.concurrent.ScheduledExecutorService membershipScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "membership-scheduler");
-                t.setDaemon(true);
-                return t;
-        });
+        private final java.util.concurrent.ScheduledExecutorService membershipScheduler = Executors
+                        .newSingleThreadScheduledExecutor(r -> {
+                                Thread t = new Thread(r, "membership-scheduler");
+                                t.setDaemon(true);
+                                return t;
+                        });
+        private final AtomicInteger missedCoordinatorPings = new AtomicInteger(0);
         private java.util.concurrent.ScheduledFuture<?> coordinatorRefreshTask;
+        private java.util.concurrent.ScheduledFuture<?> coordinatorHealthCheckTask;
 
         public WorkerNode(
                         int workerId,
@@ -60,26 +63,26 @@ public class WorkerNode implements WorkerService {
                 this.port = port;
 
                 if (port < 1 || port > 65535 || grpcPort < 0 || grpcPort > 65535 || grpcPort == port) {
-                        throw new IllegalArgumentException("Worker ports require distinct valid range 1-65535; gRPC may use 0");
+                        throw new IllegalArgumentException(
+                                        "Worker ports require distinct valid range 1-65535; gRPC may use 0");
                 }
 
                 WorkerGrpcServer startingServer = null;
                 try {
                         startingServer = new WorkerGrpcServer(
-                                workerId,
-                                grpcPort,
-                                4,
-                                () -> this.coordinatorManager,
-                                () -> this.isCoordinator,
-                                () -> common.grpc.WorkerIdentity.newBuilder()
-                                        .setWorkerId(workerId)
-                                        .setSessionId(sessionId)
-                                        .build(),
-                                this::receiveElectionMessage,
-                                this::receiveElectionReply,
-                                new ConcurrentHashMap<>(),
-                                this::refreshNeighboursFromBootstrap
-                        );
+                                        workerId,
+                                        grpcPort,
+                                        4,
+                                        () -> this.coordinatorManager,
+                                        () -> this.isCoordinator,
+                                        () -> common.grpc.WorkerIdentity.newBuilder()
+                                                        .setWorkerId(workerId)
+                                                        .setSessionId(sessionId)
+                                                        .build(),
+                                        this::receiveElectionMessage,
+                                        this::receiveElectionReply,
+                                        new ConcurrentHashMap<>(),
+                                        this::refreshNeighboursFromBootstrap);
                         startingServer.start();
                 } catch (Exception e) {
                         computationThreadPool.shutdownNow();
@@ -91,10 +94,12 @@ public class WorkerNode implements WorkerService {
                                         e.addSuppressed(interrupted);
                                 }
                         }
-                        throw new IllegalStateException("Worker " + workerId + " gRPC startup failed on port " + grpcPort, e);
+                        throw new IllegalStateException(
+                                        "Worker " + workerId + " gRPC startup failed on port " + grpcPort, e);
                 }
                 this.grpcServer = startingServer;
                 this.executionEngine = startingServer.getExecutionEngine();
+                startCoordinatorHealthChecker();
         }
 
         /**
@@ -134,7 +139,8 @@ public class WorkerNode implements WorkerService {
                 return executeJob(task, null);
         }
 
-        public JobResult executeJob(JobTask task, java.util.function.Consumer<common.grpc.TaskProgressUpdate> progressConsumer) {
+        public JobResult executeJob(JobTask task,
+                        java.util.function.Consumer<common.grpc.TaskProgressUpdate> progressConsumer) {
                 if (task == null) {
                         JobResult error = new JobResult();
                         error.setSuccess(false);
@@ -148,7 +154,8 @@ public class WorkerNode implements WorkerService {
                                                 .setJobId(task.getJobId() != null ? task.getJobId() : "")
                                                 .setTaskId(task.getTaskId() != null ? task.getTaskId() : "")
                                                 .setJobType(task.getJobType() != null
-                                                                ? common.grpc.JobTypeProto.valueOf(task.getJobType().name())
+                                                                ? common.grpc.JobTypeProto
+                                                                                .valueOf(task.getJobType().name())
                                                                 : common.grpc.JobTypeProto.JOB_TYPE_UNSPECIFIED)
                                                 .setRangeStart(task.getRangeStart())
                                                 .setRangeEnd(task.getRangeEnd());
@@ -169,8 +176,7 @@ public class WorkerNode implements WorkerService {
                                                 response.getSuccess(),
                                                 response.getResultValue(),
                                                 response.getErrorMessage(),
-                                                response.getExecutionTimeMs()
-                                );
+                                                response.getExecutionTimeMs());
                         } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                                 JobResult error = new JobResult();
@@ -213,6 +219,9 @@ public class WorkerNode implements WorkerService {
         public void startElection() {
 
                 int newTerm = currentTerm.incrementAndGet();
+                this.lastElectionStartMs = System.currentTimeMillis();
+                this.coordinatorId = -1;
+                this.missedCoordinatorPings.set(0);
 
                 System.out.println();
                 System.out.println(
@@ -266,6 +275,7 @@ public class WorkerNode implements WorkerService {
                         children.add(entry.getKey());
 
                         sendElection(
+                                        entry.getKey(),
                                         entry.getValue(),
                                         message);
                 }
@@ -367,6 +377,7 @@ public class WorkerNode implements WorkerService {
                         if (neighbour != null) {
 
                                 sendElection(
+                                                neighbourId,
                                                 neighbour,
                                                 updated);
                         }
@@ -376,6 +387,7 @@ public class WorkerNode implements WorkerService {
         }
 
         private void sendElection(
+                        int targetWorkerId,
                         WorkerService worker,
                         ElectionMessage message) {
 
@@ -396,8 +408,20 @@ public class WorkerNode implements WorkerService {
 
                         System.out.println(
                                         "Worker " + workerId +
-                                                        " could not forward ELECTION: " +
+                                                        " could not forward ELECTION to Worker " + targetWorkerId + ": " +
                                                         e.getMessage());
+                        neighbours.remove(targetWorkerId);
+                        Set<Integer> pending = pendingReplies.get(message.getMessageId());
+                        if (pending != null) {
+                                boolean emptyNow = false;
+                                synchronized (pending) {
+                                        pending.remove(targetWorkerId);
+                                        emptyNow = pending.isEmpty();
+                                }
+                                if (emptyNow) {
+                                        checkElectionFinished(message);
+                                }
+                        }
                 }
         }
 
@@ -571,6 +595,7 @@ public class WorkerNode implements WorkerService {
                 }
 
                 coordinatorId = message.getCandidateId();
+                missedCoordinatorPings.set(0);
 
                 isCoordinator = (workerId == coordinatorId);
 
@@ -646,21 +671,24 @@ public class WorkerNode implements WorkerService {
                 this.bootstrapPort = bootstrapPort;
 
                 // Pure gRPC Registration with Bootstrap
-                try (worker.grpc.BootstrapGrpcClient grpcClient = new worker.grpc.BootstrapGrpcClient(bootstrapHost, bootstrapPort)) {
+                try (worker.grpc.BootstrapGrpcClient grpcClient = new worker.grpc.BootstrapGrpcClient(bootstrapHost,
+                                bootstrapPort)) {
                         common.grpc.WorkerDescriptor descriptor = common.grpc.WorkerDescriptor.newBuilder()
-                                .setIdentity(common.grpc.WorkerIdentity.newBuilder()
-                                        .setWorkerId(workerId)
-                                        .setSessionId(sessionId)
-                                        .build())
-                                .setEndpoint(common.grpc.WorkerEndpoint.newBuilder()
-                                        .setHost(host)
-                                        .setPort(grpcServer != null ? grpcServer.getPort() : port)
-                                        .build())
-                                .build();
+                                        .setIdentity(common.grpc.WorkerIdentity.newBuilder()
+                                                        .setWorkerId(workerId)
+                                                        .setSessionId(sessionId)
+                                                        .build())
+                                        .setEndpoint(common.grpc.WorkerEndpoint.newBuilder()
+                                                        .setHost(host)
+                                                        .setPort(grpcServer != null ? grpcServer.getPort() : port)
+                                                        .build())
+                                        .build();
 
                         var regResponse = grpcClient.registerWorker(descriptor);
+                        this.bootstrapConnected = true;
                         this.registryEpoch = regResponse.getRegistryEpoch();
-                        var neighboursList = grpcClient.getInitialNeighbours(descriptor.getIdentity(), this.registryEpoch);
+                        var neighboursList = grpcClient.getInitialNeighbours(descriptor.getIdentity(),
+                                        this.registryEpoch);
 
                         for (common.grpc.WorkerDescriptor nDesc : neighboursList) {
                                 int nId = nDesc.getIdentity().getWorkerId();
@@ -673,22 +701,28 @@ public class WorkerNode implements WorkerService {
                         try {
                                 var coordResp = grpcClient.getCoordinator();
                                 if (coordResp != null && coordResp.hasCoordinator()) {
-                                        this.coordinatorId = coordResp.getCoordinator().getCoordinator().getIdentity().getWorkerId();
+                                        this.coordinatorId = coordResp.getCoordinator().getCoordinator().getIdentity()
+                                                        .getWorkerId();
                                         this.currentTerm.set(coordResp.getCoordinator().getTerm());
-                                        System.out.println("Worker " + workerId + " discovered active Coordinator: Worker " + coordinatorId + " (Term " + currentTerm.get() + ")");
+                                        System.out.println("Worker " + workerId
+                                                        + " discovered active Coordinator: Worker " + coordinatorId
+                                                        + " (Term " + currentTerm.get() + ")");
                                 }
                         } catch (Exception ignored) {
                         }
 
-                        System.out.println("Worker " + workerId + " connected to Bootstrap via gRPC (port " + bootstrapPort + ").");
+                        System.out.println("Worker " + workerId + " connected to Bootstrap via gRPC (port "
+                                        + bootstrapPort + ").");
                         System.out.println("Neighbours: " + neighbours.keySet());
                 } catch (Exception grpcEx) {
-                        System.err.println("Worker " + workerId + " failed to connect to Bootstrap via gRPC: " + grpcEx.getMessage());
+                        System.err.println("Worker " + workerId + " failed to connect to Bootstrap via gRPC: "
+                                        + grpcEx.getMessage());
                 }
         }
 
         public synchronized void refreshNeighboursFromBootstrap() {
-                try (worker.grpc.BootstrapGrpcClient grpcClient = new worker.grpc.BootstrapGrpcClient(bootstrapHost, bootstrapPort)) {
+                try (worker.grpc.BootstrapGrpcClient grpcClient = new worker.grpc.BootstrapGrpcClient(bootstrapHost,
+                                bootstrapPort)) {
                         var response = grpcClient.listWorkers();
                         if (response != null && response.hasSnapshot()) {
                                 for (common.grpc.WorkerDescriptor desc : response.getSnapshot().getWorkersList()) {
@@ -765,24 +799,25 @@ public class WorkerNode implements WorkerService {
 
                         // Connecting via pure gRPC peer client
                         common.grpc.WorkerDescriptor desc = common.grpc.WorkerDescriptor.newBuilder()
-                                .setIdentity(common.grpc.WorkerIdentity.newBuilder()
-                                        .setWorkerId(id)
-                                        .setSessionId("worker-" + id)
-                                        .build())
-                                .setEndpoint(common.grpc.WorkerEndpoint.newBuilder()
-                                        .setHost(workerHost)
-                                        .setPort(workerPort)
-                                        .build())
-                                .build();
+                                        .setIdentity(common.grpc.WorkerIdentity.newBuilder()
+                                                        .setWorkerId(id)
+                                                        .setSessionId("worker-" + id)
+                                                        .build())
+                                        .setEndpoint(common.grpc.WorkerEndpoint.newBuilder()
+                                                        .setHost(workerHost)
+                                                        .setPort(workerPort)
+                                                        .build())
+                                        .build();
 
                         worker.grpc.WorkerGrpcClient grpcClient = new worker.grpc.WorkerGrpcClient(
-                                desc,
-                                candId -> common.grpc.WorkerIdentity.newBuilder().setWorkerId(candId).setSessionId("worker-" + candId).build()
-                        );
+                                        desc,
+                                        candId -> common.grpc.WorkerIdentity.newBuilder().setWorkerId(candId)
+                                                        .setSessionId("worker-" + candId).build());
 
                         if (grpcClient.ping()) {
                                 addNeighbour(id, grpcClient);
-                                System.out.println("Worker " + workerId + " established gRPC neighbour connection with Worker " + id);
+                                System.out.println("Worker " + workerId
+                                                + " established gRPC neighbour connection with Worker " + id);
                         } else {
                                 grpcClient.close();
                         }
@@ -805,6 +840,9 @@ public class WorkerNode implements WorkerService {
                 try {
 
                         isCoordinator = true;
+                        if (currentTerm.get() <= 0) {
+                                currentTerm.set(1);
+                        }
 
                         coordinatorManager = new CoordinatorManager(
                                         workerId,
@@ -826,37 +864,48 @@ public class WorkerNode implements WorkerService {
                         // 1. Publish Coordinator to Bootstrap via pure gRPC
                         io.grpc.ManagedChannel bsChannel = null;
                         try {
-                                bsChannel = io.grpc.ManagedChannelBuilder.forAddress(bootstrapHost, bootstrapPort).usePlaintext().build();
-                                common.grpc.BootstrapServiceGrpc.BootstrapServiceBlockingStub bsStub = common.grpc.BootstrapServiceGrpc.newBlockingStub(bsChannel);
+                                bsChannel = io.grpc.ManagedChannelBuilder.forAddress(bootstrapHost, bootstrapPort)
+                                                .usePlaintext().build();
+                                common.grpc.BootstrapServiceGrpc.BootstrapServiceBlockingStub bsStub = common.grpc.BootstrapServiceGrpc
+                                                .newBlockingStub(bsChannel);
                                 // If epoch is not yet cached, fetch it from Bootstrap
                                 String epoch = registryEpoch;
                                 if (epoch == null || epoch.isEmpty()) {
                                         epoch = bsStub.withDeadlineAfter(3, java.util.concurrent.TimeUnit.SECONDS)
-                                                .getCoordinator(common.grpc.GetCoordinatorRequest.getDefaultInstance())
-                                                .getRegistryEpoch();
+                                                        .getCoordinator(common.grpc.GetCoordinatorRequest
+                                                                        .getDefaultInstance())
+                                                        .getRegistryEpoch();
                                         this.registryEpoch = epoch;
                                 }
 
                                 bsStub.withDeadlineAfter(3, java.util.concurrent.TimeUnit.SECONDS).publishCoordinator(
-                                        common.grpc.PublishCoordinatorRequest.newBuilder()
-                                                .setCoordinator(common.grpc.CoordinatorRecord.newBuilder()
-                                                        .setCoordinator(common.grpc.WorkerDescriptor.newBuilder()
-                                                                .setIdentity(common.grpc.WorkerIdentity.newBuilder()
-                                                                        .setWorkerId(workerId)
-                                                                        .setSessionId(sessionId)
-                                                                        .build())
-                                                                .setEndpoint(common.grpc.WorkerEndpoint.newBuilder()
-                                                                        .setHost(host)
-                                                                        .setPort(grpcServer != null ? grpcServer.getPort() : port)
-                                                                        .build())
-                                                                .build())
-                                                        .setTerm(currentTerm.get())
-                                                        .build())
-                                                .setRegistryEpoch(epoch)
-                                                .build());
-                                System.out.println("Worker " + workerId + " published Coordinator identity to Bootstrap via gRPC.");
+                                                common.grpc.PublishCoordinatorRequest.newBuilder()
+                                                                .setCoordinator(common.grpc.CoordinatorRecord
+                                                                                .newBuilder()
+                                                                                .setCoordinator(common.grpc.WorkerDescriptor
+                                                                                                .newBuilder()
+                                                                                                .setIdentity(common.grpc.WorkerIdentity
+                                                                                                                .newBuilder()
+                                                                                                                .setWorkerId(workerId)
+                                                                                                                .setSessionId(sessionId)
+                                                                                                                .build())
+                                                                                                .setEndpoint(common.grpc.WorkerEndpoint
+                                                                                                                .newBuilder()
+                                                                                                                .setHost(host)
+                                                                                                                .setPort(grpcServer != null
+                                                                                                                                ? grpcServer.getPort()
+                                                                                                                                : port)
+                                                                                                                .build())
+                                                                                                .build())
+                                                                                .setTerm(currentTerm.get())
+                                                                                .build())
+                                                                .setRegistryEpoch(epoch)
+                                                                .build());
+                                System.out.println("Worker " + workerId
+                                                + " published Coordinator identity to Bootstrap via gRPC.");
                         } catch (Exception e) {
-                                System.err.println("Could not publish coordinator to bootstrap via gRPC: " + e.getMessage());
+                                System.err.println("Could not publish coordinator to bootstrap via gRPC: "
+                                                + e.getMessage());
                         } finally {
                                 if (bsChannel != null) {
                                         bsChannel.shutdown();
@@ -904,6 +953,8 @@ public class WorkerNode implements WorkerService {
                 }
 
                 isCoordinator = false;
+                coordinatorId = -1;
+                missedCoordinatorPings.set(0);
 
                 System.out.println(
                                 "Worker " + workerId +
@@ -945,6 +996,154 @@ public class WorkerNode implements WorkerService {
                 return executionEngine;
         }
 
+        private volatile boolean bootstrapConnected = false;
+        private volatile long lastElectionStartMs = 0L;
+        private final AtomicInteger noCoordinatorChecks = new AtomicInteger(0);
+
+        /**
+         * If the cluster has no coordinator (e.g. the designated initiator never
+         * started), adopt one from Bootstrap if published; otherwise the
+         * highest-ID registered worker starts an election so only one flood runs.
+         */
+        private void ensureCoordinatorExists() {
+                if (!bootstrapConnected) {
+                        return;
+                }
+                try (worker.grpc.BootstrapGrpcClient bsClient = new worker.grpc.BootstrapGrpcClient(bootstrapHost, bootstrapPort)) {
+                        var coordResp = bsClient.getCoordinator();
+                        if (coordResp != null && coordResp.hasCoordinator()) {
+                                int id = coordResp.getCoordinator().getCoordinator().getIdentity().getWorkerId();
+                                if (id > 0 && id != workerId) {
+                                        coordinatorId = id;
+                                        if (coordResp.getCoordinator().getTerm() > currentTerm.get()) {
+                                                currentTerm.set(coordResp.getCoordinator().getTerm());
+                                        }
+                                        noCoordinatorChecks.set(0);
+                                        return;
+                                }
+                        }
+                        if (noCoordinatorChecks.incrementAndGet() < 2) {
+                                return;
+                        }
+                        if (System.currentTimeMillis() - lastElectionStartMs < 8000) {
+                                return;
+                        }
+                        int highest = workerId;
+                        var list = bsClient.listWorkers();
+                        if (list != null && list.hasSnapshot()) {
+                                for (common.grpc.WorkerDescriptor d : list.getSnapshot().getWorkersList()) {
+                                        highest = Math.max(highest, d.getIdentity().getWorkerId());
+                                }
+                        }
+                        if (highest == workerId) {
+                                noCoordinatorChecks.set(0);
+                                System.out.println("Worker " + workerId
+                                                + " found no active coordinator; initiating election.");
+                                startElection();
+                        }
+                } catch (Exception ignored) {
+                }
+        }
+
+        private synchronized void startCoordinatorHealthChecker() {
+                if (coordinatorHealthCheckTask != null) {
+                        return;
+                }
+                coordinatorHealthCheckTask = membershipScheduler.scheduleWithFixedDelay(
+                                this::checkCoordinatorHealth,
+                                2000, 2000, TimeUnit.MILLISECONDS);
+        }
+
+        private void checkCoordinatorHealth() {
+                if (stopped.get() || isCoordinator) {
+                        missedCoordinatorPings.set(0);
+                        return;
+                }
+
+                if (coordinatorId <= 0) {
+                        ensureCoordinatorExists();
+                        return;
+                }
+
+                int currentCoord = coordinatorId;
+                if (currentCoord <= 0 || currentCoord == workerId) {
+                        missedCoordinatorPings.set(0);
+                        return;
+                }
+
+                boolean alive = false;
+                WorkerService coordService = neighbours.get(currentCoord);
+                if (coordService != null) {
+                        try {
+                                alive = coordService.ping();
+                        } catch (Exception e) {
+                                alive = false;
+                        }
+                } else {
+                        // Coordinator not currently in neighbours map; probe endpoint via Bootstrap
+                        try (worker.grpc.BootstrapGrpcClient bsClient = new worker.grpc.BootstrapGrpcClient(bootstrapHost, bootstrapPort)) {
+                                var coordResp = bsClient.getCoordinator();
+                                if (coordResp != null && coordResp.hasCoordinator()) {
+                                        var cDesc = coordResp.getCoordinator().getCoordinator();
+                                        int bsCoordId = cDesc.getIdentity().getWorkerId();
+                                        if (bsCoordId == currentCoord) {
+                                                try (worker.grpc.WorkerGrpcClient probeClient = new worker.grpc.WorkerGrpcClient(cDesc,
+                                                                candId -> common.grpc.WorkerIdentity.newBuilder().setWorkerId(candId).setSessionId("worker-" + candId).build())) {
+                                                        alive = probeClient.ping();
+                                                        if (alive) {
+                                                                addNeighbour(currentCoord, probeClient);
+                                                        }
+                                                } catch (Exception e) {
+                                                        alive = false;
+                                                }
+                                        } else if (bsCoordId > 0) {
+                                                // Coordinator changed in Bootstrap
+                                                this.coordinatorId = bsCoordId;
+                                                this.currentTerm.set(coordResp.getCoordinator().getTerm());
+                                                alive = true;
+                                        }
+                                }
+                        } catch (Exception ignored) {
+                                alive = false;
+                        }
+                }
+
+                if (alive) {
+                        missedCoordinatorPings.set(0);
+                } else {
+                        int missed = missedCoordinatorPings.incrementAndGet();
+                        if (missed >= 2) {
+                                System.err.println("Worker " + workerId + " detected Coordinator " + currentCoord
+                                                + " unreachable after " + missed + " missed health checks. Initiating election.");
+                                missedCoordinatorPings.set(0);
+
+                                // Close and remove dead coordinator from neighbours
+                                WorkerService dead = neighbours.remove(currentCoord);
+                                if (dead instanceof worker.grpc.WorkerGrpcClient grpcCl) {
+                                        try {
+                                                grpcCl.close();
+                                        } catch (Exception ignored) {
+                                        }
+                                }
+
+                                // Clear coordinator from Bootstrap if it matches
+                                try (worker.grpc.BootstrapGrpcClient bsClient = new worker.grpc.BootstrapGrpcClient(bootstrapHost, bootstrapPort)) {
+                                        var coordResp = bsClient.getCoordinator();
+                                        if (coordResp != null && coordResp.hasCoordinator()) {
+                                                var coordRec = coordResp.getCoordinator();
+                                                if (coordRec.getCoordinator().getIdentity().getWorkerId() == currentCoord) {
+                                                        bsClient.clearCoordinator(coordRec.getCoordinator().getIdentity(), coordRec.getTerm(), coordResp.getRegistryEpoch());
+                                                }
+                                        }
+                                } catch (Exception ignored) {
+                                }
+
+                                this.coordinatorId = -1;
+                                startElection();
+                        }
+                }
+        }
+
         public void stop() {
                 if (!stopped.compareAndSet(false, true)) {
                         return;
@@ -957,6 +1156,9 @@ public class WorkerNode implements WorkerService {
                         computationThreadPool.shutdownNow();
                         if (coordinatorRefreshTask != null) {
                                 coordinatorRefreshTask.cancel(false);
+                        }
+                        if (coordinatorHealthCheckTask != null) {
+                                coordinatorHealthCheckTask.cancel(false);
                         }
                         membershipScheduler.shutdownNow();
                         if (coordinatorManager != null) {
@@ -979,4 +1181,3 @@ public class WorkerNode implements WorkerService {
                 }
         }
 }
-
