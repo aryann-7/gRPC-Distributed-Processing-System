@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+set "JAVA_TOOL_OPTIONS="
 
 REM =========================================================================
 REM CS324 Add Dynamic Worker Script (Windows)
@@ -45,6 +46,7 @@ echo gRPC Port          : %W_GRPC%
 echo Connecting to      : %BS_HOST%:%BS_PORT%
 echo =========================================================================
 
-start "Worker-%W_ID%" java -jar "%~dp0..\target\worker-node.jar" %W_ID% localhost %W_RMI% %BS_HOST% %BS_PORT% %W_GRPC%
+set JVM_FLAGS=--add-opens java.base/jdk.internal.misc=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true
+start "Worker-%W_ID%" java %JVM_FLAGS% -jar "%~dp0..\target\worker-node.jar" %W_ID% localhost %W_RMI% %BS_HOST% %BS_PORT% %W_GRPC%
 
 echo Worker-%W_ID% started in a new terminal window.
